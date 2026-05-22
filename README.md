@@ -1,5 +1,9 @@
 # handshake
 
+[![ci](https://github.com/pilot-protocol/handshake/actions/workflows/ci.yml/badge.svg)](https://github.com/pilot-protocol/handshake/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pilot-protocol/handshake/branch/main/graph/badge.svg)](https://codecov.io/gh/pilot-protocol/handshake)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 Handshake plugin for the Pilot Protocol daemon. Manages node-to-node
 trust:
 
@@ -32,3 +36,7 @@ rt.Register(s)
 | `handshake.go` | Wire format and `Manager` (in-memory trust + pending state). |
 | `runtime.go` | Daemon-facing interface for trust lookup and auto-approve flag. |
 | `service.go` | `*Service` — `coreapi.Service` adapter. |
+
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
