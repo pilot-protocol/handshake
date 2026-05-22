@@ -9,6 +9,7 @@ require (
 
 require (
 	github.com/coder/websocket v1.8.14 // indirect
+	github.com/pilot-protocol/rendezvous v0.0.0 // indirect
 	github.com/pilot-protocol/trustedagents v0.0.0 // indirect
 )
 
@@ -39,3 +40,7 @@ replace github.com/pilot-protocol/gateway => ../gateway
 replace github.com/pilot-protocol/nameserver => ../nameserver
 
 replace github.com/pilot-protocol/policy => ../policy
+
+replace github.com/pilot-protocol/rendezvous => ../rendezvous
+
+replace github.com/pilot-protocol/beacon => ../beacon
