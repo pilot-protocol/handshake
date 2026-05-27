@@ -64,6 +64,14 @@ const (
 	handshakeCloseDelay   = 500 * time.Millisecond // delay before closing after send to let data flush
 	maxReplaySetEntries   = 8192                   // cap replay set to prevent unbounded growth between reaps
 	maxPendingHandshakes  = 256                    // cap pending (unapproved) handshake requests
+	// pendingHandshakeTTL caps how long a pending (unapproved-by-
+	// operator) handshake request can sit in hm.pending before the
+	// reaper drops it. Without this, a request from a peer that the
+	// operator never approves or rejects stays in the queue forever —
+	// 4-day-old entries observed on running daemons. 30 days gives
+	// operators ample time to decide without letting the queue grow
+	// unboundedly under sustained inbound handshake pressure.
+	pendingHandshakeTTL = 30 * 24 * time.Hour
 )
 
 // Manager handles the trust handshake protocol on port 444.
@@ -169,8 +177,21 @@ func (hm *Manager) goRPCLocked(fn func()) {
 // fires exactly once per transition. Notifying under hm.mu is safe — the
 // channel close is non-blocking and trustWaitersMu is always taken AFTER
 // hm.mu in this codebase.
+//
+// Cleanup of pending + outgoing is centralized here so individual auto-
+// approve sites don't have to remember. Before this consolidation,
+// processRelayedRequest's sameNetwork / trustedAgent / autoApprove
+// branches (and the symmetric paths in handleRequest) only deleted from
+// outgoing on the mutual path — every other auto-approve trust transition
+// left a stale entry in pending and/or outgoing that pilotctl pending
+// would surface forever, and that the policy fill_trust loop could
+// re-target. delete() on a missing key is a no-op, so the callers that
+// already pre-delete (handleRequest mutual line ~583, handleAccept line
+// ~724, etc.) remain correct.
 func (hm *Manager) markTrustedLocked(nodeID uint32, rec *TrustRecord) {
 	hm.trusted[nodeID] = rec
+	delete(hm.pending, nodeID)
+	delete(hm.outgoing, nodeID)
 	hm.trustWaitersMu.Lock()
 	waiters := hm.trustWaiters[nodeID]
 	delete(hm.trustWaiters, nodeID)
@@ -373,6 +394,7 @@ func (hm *Manager) Start() error {
 			case <-ticker.C:
 				hm.reapReplay()
 				hm.reapOutgoingAndRevoked()
+				hm.reapStalePending()
 			case <-hm.reapStop:
 				return
 			}
@@ -1333,4 +1355,29 @@ func (hm *Manager) sharedNetwork(peerNodeID uint32) uint16 {
 		}
 	}
 	return 0
+}
+
+// reapStalePending evicts hm.pending entries older than
+// pendingHandshakeTTL. Called from the periodic reaper loop.
+func (hm *Manager) reapStalePending() {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+	cutoff := time.Now().Add(-pendingHandshakeTTL)
+	var stale []uint32
+	for nodeID, p := range hm.pending {
+		if p.ReceivedAt.Before(cutoff) {
+			stale = append(stale, nodeID)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	for _, id := range stale {
+		delete(hm.pending, id)
+	}
+	hm.saveTrust()
+	slog.Info("reaped stale pending handshakes",
+		"count", len(stale),
+		"ttl_hours", int(pendingHandshakeTTL/time.Hour),
+	)
 }
