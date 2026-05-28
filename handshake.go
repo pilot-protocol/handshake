@@ -3,6 +3,7 @@
 package handshake
 
 import (
+	"crypto/subtle"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -494,7 +495,7 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 			resp, err := reg.Lookup(msg.NodeID)
 			if err == nil {
 				if regPubKey, ok := resp["public_key"].(string); ok && regPubKey != "" {
-					if regPubKey != msg.PublicKey {
+					if subtle.ConstantTimeCompare([]byte(regPubKey), []byte(msg.PublicKey)) != 1 {
 						slog.Warn("handshake: pubkey mismatch with registry",
 							"peer_node_id", msg.NodeID)
 						return
