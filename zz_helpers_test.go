@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
+	"github.com/pilot-protocol/common/coreapi"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon"
-	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
-	registryclient "github.com/TeoSlayer/pilotprotocol/pkg/registry/client"
+	"github.com/pilot-protocol/common/protocol"
+	registryclient "github.com/pilot-protocol/common/registry/client"
 	"github.com/TeoSlayer/pilotprotocol/tests/regtestutil"
 	"github.com/pilot-protocol/common/crypto"
 )
