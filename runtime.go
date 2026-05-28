@@ -19,7 +19,7 @@ package handshake
 import (
 	"crypto/ed25519"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
+	"github.com/pilot-protocol/common/coreapi"
 )
 
 // Runtime is the primitives-only contract the handshake manager needs
