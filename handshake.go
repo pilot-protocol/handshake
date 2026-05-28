@@ -309,11 +309,10 @@ func (hm *Manager) saveTrust() {
 		})
 	}
 
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		slog.Error("save trust state", "err", err)
-		return
-	}
+	// MarshalIndent on trustSnapshot is infallible: every field is a
+	// primitive (uint32/string/bool/uint16), pre-formatted via
+	// time.RFC3339. The error branch is unreachable.
+	data, _ := json.MarshalIndent(snap, "", "  ")
 
 	dir := filepath.Dir(hm.storePath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -1301,10 +1300,9 @@ func (hm *Manager) sendMessage(peerNodeID uint32, msg *HandshakeMsg) error {
 		msg.Signature = hm.signHandshakeChallenge(fmt.Sprintf("handshake:%d:%d", msg.NodeID, peerNodeID))
 	}
 
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
+	// HandshakeMsg has only string and int64 fields — json.Marshal
+	// cannot fail; the error branch is unreachable.
+	data, _ := json.Marshal(msg)
 
 	return hm.rt.DialAndSend(peerNodeID, protocol.PortHandshake, data)
 }
