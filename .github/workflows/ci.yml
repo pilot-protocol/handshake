@@ -48,6 +48,10 @@ jobs:
           cache: true
           cache-dependency-path: handshake/go.sum
 
+      - name: Tidy (handshake) go.mod (absorb sibling drift)
+        working-directory: handshake
+        run: go mod tidy
+
       - name: Run tests with coverage
         working-directory: handshake
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
