@@ -1,7 +1,5 @@
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
-github.com/pilot-protocol/common v0.1.0 h1:m8mZZATgeBiFoqhWXPnskw2u0lNkWxHp0IagZK35V1g=
-github.com/pilot-protocol/common v0.1.0/go.mod h1:4YZWHK5nhM+4RLmYTspLxxAFbyBII7yzQDAHq3Ul2ck=
 github.com/pilot-protocol/rendezvous v0.1.0 h1:vOBD7CnRY8uU8vma0Vfcr0aPSQ54qNuxppNUiljzk9Y=
 github.com/pilot-protocol/rendezvous v0.1.0/go.mod h1:g3/IYBykbU5m9jeprSCrmuoDpaqROO4Lu/+ecKVIF3A=
 github.com/pilot-protocol/trustedagents v0.1.0 h1:rCX0IQxfZ84Q4dSgw01WJgjHUODRnI3iAon1t+NuFGE=
