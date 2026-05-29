@@ -12,7 +12,7 @@ import (
 	"github.com/pilot-protocol/common/coreapi"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon"
 	"github.com/pilot-protocol/common/protocol"
-	registryclient "github.com/pilot-protocol/common/registry/client"
+	tregistryclient "github.com/TeoSlayer/pilotprotocol/pkg/registry/client"
 	"github.com/TeoSlayer/pilotprotocol/tests/regtestutil"
 	"github.com/pilot-protocol/common/crypto"
 )
@@ -36,7 +36,7 @@ type testRuntime struct {
 	identity         *crypto.Identity
 	identityPath     string
 	trustAutoApprove bool
-	regClient        *registryclient.Client
+	regClient        *tregistryclient.Client
 	trustChecker     daemon.TrustChecker
 
 	// Side-effect captures useful for test assertions. The handshake
@@ -268,7 +268,7 @@ func (l *testDaemonListener) Close() error {
 	l.d.Ports().Unbind(l.inner.Port)
 	return nil
 }
-func (l *testDaemonListener) Addr() coreapi.Addr { return l.d.Addr() }
+func (l *testDaemonListener) Addr() coreapi.Addr { a := l.d.Addr(); return coreapi.Addr{Network: a.Network, Node: a.Node} }
 func (l *testDaemonListener) Port() uint16       { return l.inner.Port }
 
 // testStreamAdapter wraps *daemon.Connection as coreapi.Stream.
@@ -281,9 +281,9 @@ type testStreamAdapter struct {
 func (s *testStreamAdapter) Read(p []byte) (int, error)       { return s.rw.Read(p) }
 func (s *testStreamAdapter) Write(p []byte) (int, error)      { return s.rw.Write(p) }
 func (s *testStreamAdapter) Close() error                     { return s.rw.Close() }
-func (s *testStreamAdapter) LocalAddr() coreapi.Addr          { return s.conn.LocalAddr }
+func (s *testStreamAdapter) LocalAddr() coreapi.Addr          { return coreapi.Addr{Network: s.conn.LocalAddr.Network, Node: s.conn.LocalAddr.Node} }
 func (s *testStreamAdapter) LocalPort() uint16                { return s.conn.LocalPort }
-func (s *testStreamAdapter) RemoteAddr() coreapi.Addr         { return s.conn.RemoteAddr }
+func (s *testStreamAdapter) RemoteAddr() coreapi.Addr         { return coreapi.Addr{Network: s.conn.RemoteAddr.Network, Node: s.conn.RemoteAddr.Node} }
 func (s *testStreamAdapter) RemotePort() uint16               { return s.conn.RemotePort }
 func (s *testStreamAdapter) SetDeadline(time.Time) error      { return nil }
 func (s *testStreamAdapter) SetReadDeadline(time.Time) error  { return nil }
