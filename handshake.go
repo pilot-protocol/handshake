@@ -625,8 +625,10 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	}
 
 	// Check if we have an outgoing request to this peer (mutual handshake)
-	if _, ok := hm.outgoing[peerNodeID]; ok {
-		// Mutual! Auto-approve
+	// SEC-038: mutual auto-trust is gated on registryBound so a peer
+	// cannot claim any NodeID with their own keypair and slip into trust.
+	if _, ok := hm.outgoing[peerNodeID]; ok && registryBound {
+		// Mutual! Auto-approve (registry confirmed pubkey binding)
 		delete(hm.outgoing, peerNodeID)
 		hm.markTrustedLocked(peerNodeID, &TrustRecord{
 			NodeID:     peerNodeID,
@@ -652,7 +654,9 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	}
 
 	// Check if peers are on the same network (network trust)
-	if hm.sameNetwork(peerNodeID) {
+	// SEC-038: same-network auto-trust is gated on registryBound so a
+	// peer cannot claim any NodeID with their own keypair and slip into trust.
+	if hm.sameNetwork(peerNodeID) && registryBound {
 		hm.markTrustedLocked(peerNodeID, &TrustRecord{
 			NodeID:     peerNodeID,
 			PublicKey:  msg.PublicKey,

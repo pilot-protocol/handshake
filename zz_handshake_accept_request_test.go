@@ -104,7 +104,7 @@ func TestHandleRequestMutualAutoApprovesAndMarksMutual(t *testing.T) {
 		PublicKey: "peer-99-key",
 		Timestamp: time.Now().Unix(),
 	}
-	hm.handleRequest(nil, msg, false)
+	hm.handleRequest(nil, msg, true) // registryBound=true: peer is verified by registry
 
 	hm.mu.RLock()
 	rec, ok := hm.trusted[99]
