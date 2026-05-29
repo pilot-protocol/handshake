@@ -36,7 +36,7 @@ func TestHandleRequest_SameNetworkDirectPathAutoApproves(t *testing.T) {
 		NodeID:    99,
 		PublicKey: "peer-99-key",
 		Timestamp: time.Now().Unix(),
-	}, false)
+	}, true) // registryBound=true: peer's pubkey was confirmed by the registry
 
 	hm.mu.RLock()
 	rec, trusted := hm.trusted[99]
