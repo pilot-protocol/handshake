@@ -267,8 +267,9 @@ func (hm *Manager) removeWaiter(nodeID uint32, target chan struct{}) {
 // --- Trust persistence ---
 
 type trustSnapshot struct {
-	Trusted []trustSnapshotEntry   `json:"trusted"`
-	Pending []pendingSnapshotEntry `json:"pending,omitempty"`
+	Trusted []trustSnapshotEntry    `json:"trusted"`
+	Pending []pendingSnapshotEntry  `json:"pending,omitempty"`
+	Revoked []revokedSnapshotEntry  `json:"revoked,omitempty"`
 }
 
 type trustSnapshotEntry struct {
@@ -284,6 +285,11 @@ type pendingSnapshotEntry struct {
 	PublicKey     string `json:"public_key,omitempty"`
 	Justification string `json:"justification,omitempty"`
 	ReceivedAt    string `json:"received_at"`
+}
+
+type revokedSnapshotEntry struct {
+	NodeID   uint32 `json:"node_id"`
+	Until    string `json:"until"` // RFC3339 timestamp of cooldown expiry
 }
 
 func (hm *Manager) saveTrust() {
@@ -309,6 +315,15 @@ func (hm *Manager) saveTrust() {
 			ReceivedAt:    p.ReceivedAt.Format(time.RFC3339),
 		})
 	}
+	for nodeID, until := range hm.revoked {
+		// Only persist entries whose cooldown hasn't expired yet.
+		if time.Now().Before(until) {
+			snap.Revoked = append(snap.Revoked, revokedSnapshotEntry{
+				NodeID: nodeID,
+				Until:  until.Format(time.RFC3339),
+			})
+		}
+	}
 
 	// MarshalIndent on trustSnapshot is infallible: every field is a
 	// primitive (uint32/string/bool/uint16), pre-formatted via
@@ -325,7 +340,7 @@ func (hm *Manager) saveTrust() {
 		slog.Error("write trust state", "err", err)
 		return
 	}
-	slog.Debug("trust state saved", "peers", len(hm.trusted), "pending", len(hm.pending))
+	slog.Debug("trust state saved", "peers", len(hm.trusted), "pending", len(hm.pending), "revoked", len(snap.Revoked))
 }
 
 func (hm *Manager) loadTrust() {
@@ -363,7 +378,17 @@ func (hm *Manager) loadTrust() {
 			ReceivedAt:    received,
 		}
 	}
-	slog.Info("loaded trust state", "peers", len(hm.trusted), "pending", len(hm.pending))
+	for _, e := range snap.Revoked {
+		until, err := time.Parse(time.RFC3339, e.Until)
+		if err != nil {
+			continue
+		}
+		// Only restore if the cooldown hasn't expired yet.
+		if time.Now().Before(until) {
+			hm.revoked[e.NodeID] = until
+		}
+	}
+	slog.Info("loaded trust state", "peers", len(hm.trusted), "pending", len(hm.pending), "revoked", len(hm.revoked))
 }
 
 // Start binds port 444 and begins handling handshake connections.
