@@ -30,6 +30,18 @@ jobs:
           repository: pilot-protocol/common
           path: common
 
+      - name: Checkout "trustedagents"
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/"trustedagents"
+          path: "trustedagents"
+
+      - name: Checkout "rendezvous"
+        uses: actions/checkout@v4
+        with:
+          repository: pilot-protocol/"rendezvous"
+          path: "rendezvous"
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
