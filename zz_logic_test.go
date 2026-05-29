@@ -76,6 +76,52 @@ func TestSaveLoadTrustRoundTripPreservesEntries(t *testing.T) {
 	}
 }
 
+func TestSaveLoadTrustRoundTripPreservesRevoked(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	idPath := filepath.Join(dir, "identity.json")
+	hm := newTestHM(t, idPath)
+	if hm.storePath == "" {
+		t.Fatal("storePath should be derived from IdentityPath")
+	}
+
+	// Add a revoked entry with a cooldown 10 minutes in the future.
+	futureCooldown := time.Now().Add(10 * time.Minute).Truncate(time.Second).UTC()
+	hm.revoked[13] = futureCooldown
+	hm.saveTrust()
+
+	// Load into a fresh manager — revoked[13] must survive the roundtrip.
+	hm2 := newTestHM(t, idPath)
+	until, ok := hm2.revoked[13]
+	if !ok {
+		t.Fatal("revoked[13] missing after load — restart resurrects revoked peers")
+	}
+	if !until.Equal(futureCooldown) {
+		t.Fatalf("revoked[13] = %v, want %v", until, futureCooldown)
+	}
+}
+
+func TestLoadTrustDropsExpiredRevokedCooldowns(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	idPath := filepath.Join(dir, "identity.json")
+	hm := newTestHM(t, idPath)
+	if hm.storePath == "" {
+		t.Fatal("storePath should be derived from IdentityPath")
+	}
+
+	// Add a revoked entry whose cooldown is already in the past.
+	pastCooldown := time.Now().Add(-1 * time.Minute).Truncate(time.Second).UTC()
+	hm.revoked[7] = pastCooldown
+	hm.saveTrust()
+
+	// Load — expired cooldown should be silently dropped.
+	hm2 := newTestHM(t, idPath)
+	if _, ok := hm2.revoked[7]; ok {
+		t.Fatal("revoked[7] should be dropped on load — cooldown already expired")
+	}
+}
+
 func TestLoadTrustMissingFileIsNoop(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
