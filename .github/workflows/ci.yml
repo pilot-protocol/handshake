@@ -140,7 +140,7 @@ jobs:
         working-directory: handshake
         run: go tool cover -func=coverage.out | tail -20
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-handshake
           path: handshake/coverage.out
