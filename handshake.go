@@ -396,7 +396,12 @@ func (hm *Manager) loadTrust() {
 	}
 
 	for _, e := range snap.Trusted {
-		approved, _ := time.Parse(time.RFC3339, e.ApprovedAt)
+		approved, err := time.Parse(time.RFC3339, e.ApprovedAt)
+		if err != nil {
+			slog.Warn("trust entry has malformed ApprovedAt — skipping",
+				"node_id", e.NodeID, "approved_at", e.ApprovedAt, "err", err)
+			continue
+		}
 		hm.trusted[e.NodeID] = &TrustRecord{
 			NodeID:     e.NodeID,
 			PublicKey:  e.PublicKey,
@@ -406,7 +411,12 @@ func (hm *Manager) loadTrust() {
 		}
 	}
 	for _, e := range snap.Pending {
-		received, _ := time.Parse(time.RFC3339, e.ReceivedAt)
+		received, err := time.Parse(time.RFC3339, e.ReceivedAt)
+		if err != nil {
+			slog.Warn("pending entry has malformed ReceivedAt — skipping",
+				"node_id", e.NodeID, "received_at", e.ReceivedAt, "err", err)
+			continue
+		}
 		hm.pending[e.NodeID] = &PendingHandshake{
 			NodeID:        e.NodeID,
 			PublicKey:     e.PublicKey,
@@ -417,6 +427,8 @@ func (hm *Manager) loadTrust() {
 	for _, e := range snap.Revoked {
 		until, err := time.Parse(time.RFC3339, e.Until)
 		if err != nil {
+			slog.Warn("revoked entry has malformed Until — skipping",
+				"node_id", e.NodeID, "until", e.Until, "err", err)
 			continue
 		}
 		// Only restore if the cooldown hasn't expired yet.
