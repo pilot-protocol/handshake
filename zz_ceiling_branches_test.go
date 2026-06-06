@@ -496,8 +496,19 @@ func TestReapStalePending_PersistsViaSaveTrust(t *testing.T) {
 	hm.reapStalePending()
 
 	// trust.json now exists and reflects the empty pending slot.
+	// PILOT-325: saveTrust now defers fsync to a drain goroutine, so the
+	// write is asynchronous. Poll briefly for the file to land.
 	trustPath := filepath.Join(dir, "trust.json")
-	data, err := os.ReadFile(trustPath)
+	var data []byte
+	var err error
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err = os.ReadFile(trustPath)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("trust.json not written after reap: %v", err)
 	}
