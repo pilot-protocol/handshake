@@ -8,7 +8,6 @@ import (
 
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon"
 	"github.com/pilot-protocol/common/protocol"
-	tprotocol "github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
 
 // Iter-114 coverage for Manager.Start — the port-444 service bootstrap
@@ -76,7 +75,7 @@ func TestHandshakeManagerStartAcceptLoopDispatchesToHandleConnection(t *testing.
 	conn := &daemon.Connection{
 		ID:         999,
 		RecvBuf:    make(chan []byte, 1),
-		RemoteAddr: tprotocol.Addr{Network: 1, Node: 0xAA00BB00},
+		RemoteAddr: protocol.Addr{Network: 1, Node: 0xAA00BB00},
 		RemotePort: 12345,
 	}
 	conn.CloseRecvBuf()
