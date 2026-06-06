@@ -12,7 +12,7 @@ import (
 	"github.com/pilot-protocol/common/coreapi"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon"
 	"github.com/pilot-protocol/common/protocol"
-	tregistryclient "github.com/TeoSlayer/pilotprotocol/pkg/registry/client"
+	tregistryclient "github.com/pilot-protocol/common/registry/client"
 	"github.com/TeoSlayer/pilotprotocol/tests/regtestutil"
 	"github.com/pilot-protocol/common/crypto"
 )
