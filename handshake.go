@@ -139,9 +139,11 @@ func (hm *Manager) Stop() {
 	hm.stopping = true
 	hm.mu.Unlock()
 
-	close(hm.done)
-
+	// Both done and reapStop share stopOnce so a double-Stop (common in
+	// test cleanup paths that defer hm.Stop() while a parent also calls it)
+	// doesn't panic with "close of closed channel".
 	hm.stopOnce.Do(func() {
+		close(hm.done)
 		if hm.reapStop != nil {
 			close(hm.reapStop)
 		}
