@@ -1031,17 +1031,26 @@ func TestSaveTrust_TrustedWithoutMutualSerializes(t *testing.T) {
 // loadTrust: malformed timestamps load as zero (no panic)
 // -----------------------------------------------------------------------
 
-func TestLoadTrust_MalformedTimestampLoadsZero(t *testing.T) {
+func TestLoadTrust_MalformedTimestampSkipsEntry(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	idPath := filepath.Join(dir, "identity.json")
 	trustPath := filepath.Join(dir, "trust.json")
+	// Per PILOT-326, a malformed RFC3339 timestamp must NOT be restored with a
+	// fabricated zero-time (1970-01-01) — that silently corrupts downstream
+	// "trust is N days old" telemetry. Instead loadTrust logs and skips the
+	// offending entry. Well-formed sibling entries in the same snapshot must
+	// still load, proving the loop continues past a bad record rather than
+	// aborting.
+	good := time.Now().UTC().Truncate(time.Second)
 	snap := trustSnapshot{
 		Trusted: []trustSnapshotEntry{
 			{NodeID: 1, PublicKey: "pk", ApprovedAt: "garbage-not-rfc3339"},
+			{NodeID: 3, PublicKey: "pk3", ApprovedAt: good.Format(time.RFC3339)},
 		},
 		Pending: []pendingSnapshotEntry{
 			{NodeID: 2, ReceivedAt: "also-garbage"},
+			{NodeID: 4, ReceivedAt: good.Format(time.RFC3339)},
 		},
 	}
 	data, _ := json.MarshalIndent(snap, "", "  ")
@@ -1051,14 +1060,25 @@ func TestLoadTrust_MalformedTimestampLoadsZero(t *testing.T) {
 	hm := newTestHM(t, idPath)
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
-	if _, ok := hm.trusted[1]; !ok {
-		t.Fatal("trusted[1] should load even with bogus timestamp")
+
+	// Malformed entries are dropped, not restored with bogus zero-time.
+	if _, ok := hm.trusted[1]; ok {
+		t.Fatal("trusted[1] with malformed ApprovedAt should be skipped, not loaded")
 	}
-	if !hm.trusted[1].ApprovedAt.IsZero() {
-		t.Fatalf("malformed timestamp should parse to zero, got %v", hm.trusted[1].ApprovedAt)
+	if _, ok := hm.pending[2]; ok {
+		t.Fatal("pending[2] with malformed ReceivedAt should be skipped, not loaded")
 	}
-	if _, ok := hm.pending[2]; !ok {
-		t.Fatal("pending[2] should load even with bogus timestamp")
+
+	// Well-formed sibling entries still load — the loop continues past the bad one.
+	rec, ok := hm.trusted[3]
+	if !ok {
+		t.Fatal("trusted[3] with valid timestamp should load")
+	}
+	if !rec.ApprovedAt.Equal(good) {
+		t.Fatalf("trusted[3] ApprovedAt = %v, want %v", rec.ApprovedAt, good)
+	}
+	if _, ok := hm.pending[4]; !ok {
+		t.Fatal("pending[4] with valid timestamp should load")
 	}
 }
 
