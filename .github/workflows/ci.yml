@@ -116,7 +116,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version-file: handshake/go.mod
           cache: true
           cache-dependency-path: handshake/go.sum
 
