@@ -1,6 +1,6 @@
 module github.com/pilot-protocol/handshake
 
-go 1.25.10
+go 1.25.12
 
 require (
 	github.com/pilot-protocol/pilotprotocol v0.0.0
