@@ -114,7 +114,7 @@ jobs:
           repository: pilot-protocol/libpilot
           path: libpilot
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: handshake/go.mod
           cache: true
