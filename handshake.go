@@ -3,21 +3,23 @@
 package handshake
 
 import (
-	"crypto/subtle"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/pilot-protocol/common/coreapi"
-	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/fsutil"
+	"github.com/pilot-protocol/common/protocol"
 )
 
 // Handshake message types.
@@ -54,6 +56,7 @@ type PendingHandshake struct {
 	PublicKey     string
 	Justification string
 	ReceivedAt    time.Time
+	Source        uint32
 }
 
 // Handshake timing constants.
@@ -65,6 +68,8 @@ const (
 	handshakeCloseDelay   = 500 * time.Millisecond // delay before closing after send to let data flush
 	maxReplaySetEntries   = 8192                   // cap replay set to prevent unbounded growth between reaps
 	maxPendingHandshakes  = 256                    // cap pending (unapproved) handshake requests
+	maxPendingPerSource   = 16
+	maxJustificationLen   = 1024
 	// pendingHandshakeTTL caps how long a pending (unapproved-by-
 	// operator) handshake request can sit in hm.pending before the
 	// reaper drops it. Without this, a request from a peer that the
@@ -77,20 +82,21 @@ const (
 
 // Manager handles the trust handshake protocol on port 444.
 type Manager struct {
-	mu        sync.RWMutex
-	rt        Runtime
-	ln        coreapi.Listener             // bound on PortHandshake; closed by Stop
-	trusted   map[uint32]*TrustRecord      // approved peers
-	pending   map[uint32]*PendingHandshake // incoming unapproved requests
-	outgoing  map[uint32]time.Time         // nodes we've sent requests to → sent-at (for TTL reap)
-	revoked   map[uint32]time.Time         // peer → cooldown-until (blocks stale relayed approvals)
-	storePath string                       // path to persist trust state (empty = no persistence)
-	stopping  bool                         // set under mu.Lock() before wg.Wait() in Stop
-	wg        sync.WaitGroup               // tracks background RPCs for clean shutdown
-	reapStop  chan struct{}                // signals replay reaper to stop
-	stopOnce  sync.Once                    // ensures reapStop is closed only once
-	dirty     chan struct{}                // buffered 1: non-blocking signal to drain goroutine
-	done      chan struct{}                // closed in Stop to signal drain goroutine exit
+	mu              sync.RWMutex
+	rt              Runtime
+	ln              coreapi.Listener             // bound on PortHandshake; closed by Stop
+	trusted         map[uint32]*TrustRecord      // approved peers
+	pending         map[uint32]*PendingHandshake // incoming unapproved requests
+	pendingBySource map[uint32]int
+	outgoing        map[uint32]time.Time // nodes we've sent requests to → sent-at (for TTL reap)
+	revoked         map[uint32]time.Time // peer → cooldown-until (blocks stale relayed approvals)
+	storePath       string               // path to persist trust state (empty = no persistence)
+	stopping        bool                 // set under mu.Lock() before wg.Wait() in Stop
+	wg              sync.WaitGroup       // tracks background RPCs for clean shutdown
+	reapStop        chan struct{}        // signals replay reaper to stop
+	stopOnce        sync.Once            // ensures reapStop is closed only once
+	dirty           chan struct{}        // buffered 1: non-blocking signal to drain goroutine
+	done            chan struct{}        // closed in Stop to signal drain goroutine exit
 
 	// Replay protection
 	replayMu  sync.Mutex
@@ -108,15 +114,16 @@ type Manager struct {
 // path; otherwise the manager is in-memory only.
 func NewManager(rt Runtime) *Manager {
 	hm := &Manager{
-		rt:           rt,
-		trusted:      make(map[uint32]*TrustRecord),
-		pending:      make(map[uint32]*PendingHandshake),
-		outgoing:     make(map[uint32]time.Time),
-		revoked:      make(map[uint32]time.Time),
-		replaySet:    make(map[[32]byte]time.Time),
-		trustWaiters: make(map[uint32][]chan struct{}),
-		dirty:        make(chan struct{}, 1),
-		done:         make(chan struct{}),
+		rt:              rt,
+		trusted:         make(map[uint32]*TrustRecord),
+		pending:         make(map[uint32]*PendingHandshake),
+		pendingBySource: make(map[uint32]int),
+		outgoing:        make(map[uint32]time.Time),
+		revoked:         make(map[uint32]time.Time),
+		replaySet:       make(map[[32]byte]time.Time),
+		trustWaiters:    make(map[uint32][]chan struct{}),
+		dirty:           make(chan struct{}, 1),
+		done:            make(chan struct{}),
 	}
 
 	if path := rt.IdentityPath(); path != "" {
@@ -201,7 +208,7 @@ func (hm *Manager) goRPCLocked(fn func()) {
 // ~724, etc.) remain correct.
 func (hm *Manager) markTrustedLocked(nodeID uint32, rec *TrustRecord) {
 	hm.trusted[nodeID] = rec
-	delete(hm.pending, nodeID)
+	hm.deletePendingLocked(nodeID)
 	delete(hm.outgoing, nodeID)
 	hm.trustWaitersMu.Lock()
 	waiters := hm.trustWaiters[nodeID]
@@ -277,9 +284,9 @@ func (hm *Manager) removeWaiter(nodeID uint32, target chan struct{}) {
 // --- Trust persistence ---
 
 type trustSnapshot struct {
-	Trusted []trustSnapshotEntry    `json:"trusted"`
-	Pending []pendingSnapshotEntry  `json:"pending,omitempty"`
-	Revoked []revokedSnapshotEntry  `json:"revoked,omitempty"`
+	Trusted []trustSnapshotEntry   `json:"trusted"`
+	Pending []pendingSnapshotEntry `json:"pending,omitempty"`
+	Revoked []revokedSnapshotEntry `json:"revoked,omitempty"`
 }
 
 type trustSnapshotEntry struct {
@@ -295,11 +302,12 @@ type pendingSnapshotEntry struct {
 	PublicKey     string `json:"public_key,omitempty"`
 	Justification string `json:"justification,omitempty"`
 	ReceivedAt    string `json:"received_at"`
+	Source        uint32 `json:"source,omitempty"`
 }
 
 type revokedSnapshotEntry struct {
-	NodeID   uint32 `json:"node_id"`
-	Until    string `json:"until"` // RFC3339 timestamp of cooldown expiry
+	NodeID uint32 `json:"node_id"`
+	Until  string `json:"until"` // RFC3339 timestamp of cooldown expiry
 }
 
 func (hm *Manager) saveTrust() {
@@ -326,6 +334,7 @@ func (hm *Manager) saveTrust() {
 			PublicKey:     p.PublicKey,
 			Justification: p.Justification,
 			ReceivedAt:    p.ReceivedAt.Format(time.RFC3339),
+			Source:        p.Source,
 		})
 	}
 	for nodeID, until := range hm.revoked {
@@ -422,6 +431,13 @@ func (hm *Manager) loadTrust() {
 			PublicKey:     e.PublicKey,
 			Justification: e.Justification,
 			ReceivedAt:    received,
+			Source:        e.Source,
+		}
+		if e.Source != 0 {
+			if hm.pendingBySource == nil {
+				hm.pendingBySource = make(map[uint32]int)
+			}
+			hm.pendingBySource[e.Source]++
 		}
 	}
 	for _, e := range snap.Revoked {
@@ -556,6 +572,10 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 
 	// M12 fix: verify P2P signature if the sender provides a public key
 	registryBound := false
+	if msg.PublicKey == "" && msg.Type == HandshakeRequest {
+		slog.Warn("handshake: request missing public key, rejecting", "peer_node_id", msg.NodeID)
+		return
+	}
 	if msg.PublicKey != "" {
 		if msg.Signature == "" {
 			slog.Warn("handshake: missing signature from authenticated node", "peer_node_id", msg.NodeID)
@@ -647,6 +667,48 @@ func (hm *Manager) reapOutgoingAndRevoked() {
 	}
 }
 
+func (hm *Manager) deletePendingLocked(nodeID uint32) {
+	p, ok := hm.pending[nodeID]
+	if !ok {
+		return
+	}
+	delete(hm.pending, nodeID)
+	if p.Source == 0 || hm.pendingBySource == nil {
+		return
+	}
+	if hm.pendingBySource[p.Source] <= 1 {
+		delete(hm.pendingBySource, p.Source)
+	} else {
+		hm.pendingBySource[p.Source]--
+	}
+}
+
+func (hm *Manager) setPendingLocked(nodeID uint32, entry *PendingHandshake) {
+	hm.deletePendingLocked(nodeID)
+	hm.pending[nodeID] = entry
+	if entry.Source == 0 {
+		return
+	}
+	if hm.pendingBySource == nil {
+		hm.pendingBySource = make(map[uint32]int)
+	}
+	hm.pendingBySource[entry.Source]++
+}
+
+func sanitizeJustification(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsPrint(r) {
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	if len(out) > maxJustificationLen {
+		out = out[:maxJustificationLen]
+	}
+	return out
+}
+
 // handleRequest processes an incoming handshake request.
 //
 // registryBound is true iff processMessage confirmed the claimed
@@ -655,11 +717,15 @@ func (hm *Manager) reapOutgoingAndRevoked() {
 // agents auto-accept path; signature-only authentication is not
 // enough to safely key on node_id.
 func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, registryBound bool) {
-	_ = stream // reserved for future response-on-same-stream support
 	peerNodeID := msg.NodeID
-	slog.Info("handshake request received", "peer_node_id", peerNodeID, "justification", msg.Justification)
+	var source uint32
+	if stream != nil {
+		source = stream.RemoteAddr().Node
+	}
+	justification := sanitizeJustification(msg.Justification)
+	slog.Info("handshake request received", "peer_node_id", peerNodeID, "justification", justification)
 	hm.rt.PublishEvent("handshake.received", map[string]interface{}{
-		"peer_node_id": peerNodeID, "justification": msg.Justification,
+		"peer_node_id": peerNodeID, "justification": justification,
 	})
 
 	hm.mu.Lock()
@@ -785,20 +851,27 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	}
 
 	// Store as pending (cap to prevent unbounded growth from spam)
-	if _, exists := hm.pending[peerNodeID]; !exists && len(hm.pending) >= maxPendingHandshakes {
-		slog.Warn("pending handshake queue full, rejecting", "peer_node_id", peerNodeID)
-		return
+	if _, exists := hm.pending[peerNodeID]; !exists {
+		if len(hm.pending) >= maxPendingHandshakes {
+			slog.Warn("pending handshake queue full, rejecting", "peer_node_id", peerNodeID)
+			return
+		}
+		if source != 0 && hm.pendingBySource[source] >= maxPendingPerSource {
+			slog.Warn("pending handshake queue full for source, rejecting", "peer_node_id", peerNodeID, "source", source)
+			return
+		}
 	}
-	hm.pending[peerNodeID] = &PendingHandshake{
+	hm.setPendingLocked(peerNodeID, &PendingHandshake{
 		NodeID:        peerNodeID,
 		PublicKey:     msg.PublicKey,
-		Justification: msg.Justification,
+		Justification: justification,
 		ReceivedAt:    time.Now(),
-	}
+		Source:        source,
+	})
 	hm.markDirty()
 	slog.Info("handshake request pending approval", "peer_node_id", peerNodeID)
 	hm.rt.PublishEvent("handshake.pending", map[string]interface{}{
-		"peer_node_id": peerNodeID, "justification": msg.Justification,
+		"peer_node_id": peerNodeID, "justification": justification,
 	})
 }
 
@@ -906,6 +979,7 @@ func (hm *Manager) ProcessRelayedRequest(fromNodeID uint32, justification string
 
 // processRelayedRequest handles a handshake request received via registry relay.
 func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string) {
+	justification = sanitizeJustification(justification)
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
@@ -1021,11 +1095,22 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 	}
 
 	// Store as pending (for manual approval via pilotctl approve)
-	hm.pending[fromNodeID] = &PendingHandshake{
+	if _, exists := hm.pending[fromNodeID]; !exists {
+		if len(hm.pending) >= maxPendingHandshakes {
+			slog.Warn("pending handshake queue full, rejecting relayed request", "peer_node_id", fromNodeID)
+			return
+		}
+		if hm.pendingBySource[fromNodeID] >= maxPendingPerSource {
+			slog.Warn("pending handshake queue full for source, rejecting relayed request", "peer_node_id", fromNodeID)
+			return
+		}
+	}
+	hm.setPendingLocked(fromNodeID, &PendingHandshake{
 		NodeID:        fromNodeID,
 		Justification: justification,
 		ReceivedAt:    time.Now(),
-	}
+		Source:        fromNodeID,
+	})
 	hm.markDirty()
 	slog.Info("relayed handshake request pending approval", "from_node_id", fromNodeID, "justification", justification)
 }
@@ -1125,7 +1210,6 @@ func (hm *Manager) ApproveHandshake(peerNodeID uint32) error {
 		hm.mu.Unlock()
 		return nil
 	}
-	delete(hm.pending, peerNodeID)
 	hm.markTrustedLocked(peerNodeID, &TrustRecord{
 		NodeID:     peerNodeID,
 		PublicKey:  req.PublicKey,
@@ -1161,7 +1245,7 @@ func (hm *Manager) ApproveHandshake(peerNodeID uint32) error {
 // RejectHandshake rejects a pending handshake request.
 func (hm *Manager) RejectHandshake(peerNodeID uint32, reason string) error {
 	hm.mu.Lock()
-	delete(hm.pending, peerNodeID)
+	hm.deletePendingLocked(peerNodeID)
 	hm.markDirty()
 	hm.mu.Unlock()
 
@@ -1204,7 +1288,7 @@ func (hm *Manager) RevokeTrust(peerNodeID uint32) error {
 	_, wasTrusted := hm.trusted[peerNodeID]
 	_, wasPending := hm.pending[peerNodeID]
 	delete(hm.trusted, peerNodeID)
-	delete(hm.pending, peerNodeID)
+	hm.deletePendingLocked(peerNodeID)
 	delete(hm.outgoing, peerNodeID)
 	// Block stale relayed approvals still sitting in the registry inbox from
 	// re-establishing trust right after a local revoke. 5-minute cooldown covers
@@ -1269,7 +1353,7 @@ func (hm *Manager) handleRevokeMsg(msg *HandshakeMsg) {
 	_, wasTrusted := hm.trusted[peerNodeID]
 	_, wasPending := hm.pending[peerNodeID]
 	delete(hm.trusted, peerNodeID)
-	delete(hm.pending, peerNodeID)
+	hm.deletePendingLocked(peerNodeID)
 	delete(hm.outgoing, peerNodeID)
 	if wasTrusted || wasPending {
 		hm.markDirty()
@@ -1449,7 +1533,7 @@ func (hm *Manager) reapStalePending() {
 		return
 	}
 	for _, id := range stale {
-		delete(hm.pending, id)
+		hm.deletePendingLocked(id)
 	}
 	hm.markDirty()
 	slog.Info("reaped stale pending handshakes",
