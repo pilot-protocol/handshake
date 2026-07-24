@@ -232,25 +232,19 @@ func TestProcessRelayedApprovalEstablishesTrustAndClearsOutgoing(t *testing.T) {
 	}
 }
 
-// --- processRelayedApproval: no outgoing entry still establishes trust ---
+// --- processRelayedApproval: no outgoing entry is dropped, not trusted ---
 
-func TestProcessRelayedApprovalNoOutgoingStillEstablishes(t *testing.T) {
+func TestProcessRelayedApprovalNoOutgoingDropped(t *testing.T) {
 	t.Parallel()
-	// The outgoing map is not a precondition — if somehow the registry relays an
-	// approval for a peer we didn't track as outgoing, the code still promotes
-	// them to trusted (delete of missing key is a safe no-op in Go).
 	hm := newTestHM(t, "")
 	t.Cleanup(hm.Stop)
 
 	hm.processRelayedApproval(300)
 
 	hm.mu.RLock()
-	rec, ok := hm.trusted[300]
+	_, ok := hm.trusted[300]
 	hm.mu.RUnlock()
-	if !ok {
-		t.Fatal("trusted[300] missing — relayed approval without outgoing should still establish")
-	}
-	if !rec.Mutual {
-		t.Fatal("rec.Mutual should be true")
+	if ok {
+		t.Fatal("trusted[300] set — relayed approval without an outgoing request must be dropped")
 	}
 }
