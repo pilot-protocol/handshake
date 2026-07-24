@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pilot-protocol/common/coreapi"
 	"github.com/pilot-protocol/common/crypto"
 )
 
@@ -307,7 +308,7 @@ func TestProcessMessageDispatchesHandshakeAccept(t *testing.T) {
 		NodeID:    44,
 		Timestamp: time.Now().Unix(),
 	}
-	hm.processMessage(nil, msg)
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 44}}, msg)
 
 	hm.mu.RLock()
 	_, ok := hm.trusted[44]

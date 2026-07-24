@@ -553,9 +553,8 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 		return
 	}
 
-	// Replay detection: hash the message and check set
-	msgBytes, _ := json.Marshal(msg)
-	msgHash := sha256.Sum256(msgBytes)
+	replayChallenge := fmt.Sprintf("handshake:%d:%d", msg.NodeID, hm.rt.NodeID())
+	msgHash := sha256.Sum256([]byte(msg.Type + "\x00" + replayChallenge + "\x00" + msg.Signature))
 	hm.replayMu.Lock()
 	if _, seen := hm.replaySet[msgHash]; seen {
 		hm.replayMu.Unlock()
@@ -612,6 +611,18 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 		}
 		if !crypto.Verify(pubKeyBytes, []byte(challenge), sigBytes) {
 			slog.Warn("handshake: P2P signature verification failed", "peer_node_id", msg.NodeID)
+			return
+		}
+	}
+
+	if msg.Type == HandshakeAccept || msg.Type == HandshakeRevoke {
+		if stream == nil || stream.RemoteAddr().Node != msg.NodeID {
+			var authenticated uint32
+			if stream != nil {
+				authenticated = stream.RemoteAddr().Node
+			}
+			slog.Warn("handshake: accept/revoke node_id does not match authenticated sender, rejecting",
+				"claimed_node_id", msg.NodeID, "authenticated_node_id", authenticated, "type", msg.Type)
 			return
 		}
 	}
@@ -1142,6 +1153,11 @@ func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
 			return
 		}
 		delete(hm.revoked, fromNodeID)
+	}
+
+	if _, ok := hm.outgoing[fromNodeID]; !ok {
+		slog.Warn("dropping relayed approval with no matching outgoing request", "peer_node_id", fromNodeID)
+		return
 	}
 
 	delete(hm.outgoing, fromNodeID)

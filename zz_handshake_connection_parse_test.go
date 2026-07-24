@@ -327,7 +327,7 @@ func TestProcessMessageRevokeDispatchRemovesTrusted(t *testing.T) {
 		NodeID:    99,
 		Timestamp: time.Now().Unix(),
 	}
-	hm.processMessage(nil, msg)
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 99}}, msg)
 
 	hm.mu.RLock()
 	_, stillTrusted := hm.trusted[99]
