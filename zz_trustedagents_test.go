@@ -177,7 +177,7 @@ func TestHandleRequestTrustedAgentAlreadyTrustedNoRewrite(t *testing.T) {
 	msg := &HandshakeMsg{
 		Type:      HandshakeRequest,
 		NodeID:    trustedNodeID,
-		PublicKey: "new-pubkey-must-be-ignored",
+		PublicKey: originalKey,
 		Timestamp: time.Now().Unix(),
 	}
 	hm.handleRequest(nil, msg, true)
@@ -186,10 +186,56 @@ func TestHandleRequestTrustedAgentAlreadyTrustedNoRewrite(t *testing.T) {
 	rec := hm.trusted[trustedNodeID]
 	hm.mu.RUnlock()
 
+	if rec == nil {
+		t.Fatal("trust record dropped for a request carrying the bound key")
+	}
 	if rec.PublicKey != originalKey {
 		t.Fatalf("PublicKey overwritten: got %q, want %q", rec.PublicKey, originalKey)
 	}
 	if !rec.ApprovedAt.Equal(originalAt) {
 		t.Fatalf("ApprovedAt overwritten: got %v, want %v", rec.ApprovedAt, originalAt)
+	}
+}
+
+// A trusted-agents node ID that turns up under a different key does not
+// carry the old record forward: it is dropped, and the allowlist +
+// registry binding then re-grants trust bound to the new key. The
+// re-grant is what makes the entry an allowlist; what must not happen
+// is the old record surviving with a stale key.
+func TestHandleRequestTrustedAgentDifferentKeyRebinds(t *testing.T) {
+	setTestTrustedAgents(t, []testAgent{
+		{Hostname: "list-agents", NodeID: trustedNodeID},
+	})
+
+	hm, _ := hsTestManager(t, false)
+	defer waitForGoRPCDrain()
+
+	originalAt := time.Now().Add(-1 * time.Hour)
+	hm.trusted[trustedNodeID] = &TrustRecord{
+		NodeID:     trustedNodeID,
+		PublicKey:  "original-pubkey",
+		ApprovedAt: originalAt,
+	}
+
+	msg := &HandshakeMsg{
+		Type:      HandshakeRequest,
+		NodeID:    trustedNodeID,
+		PublicKey: "reclaimed-pubkey",
+		Timestamp: time.Now().Unix(),
+	}
+	hm.handleRequest(nil, msg, true)
+
+	hm.mu.RLock()
+	rec := hm.trusted[trustedNodeID]
+	hm.mu.RUnlock()
+
+	if rec == nil {
+		t.Fatal("allowlisted node should be re-granted trust under its new key")
+	}
+	if rec.PublicKey != "reclaimed-pubkey" {
+		t.Fatalf("stale key survived: got %q, want %q", rec.PublicKey, "reclaimed-pubkey")
+	}
+	if !rec.ApprovedAt.After(originalAt) {
+		t.Fatalf("ApprovedAt not refreshed: got %v, want after %v", rec.ApprovedAt, originalAt)
 	}
 }

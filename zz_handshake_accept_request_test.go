@@ -71,21 +71,91 @@ func TestHandleRequestAlreadyTrustedSendsAcceptWithoutDuplicating(t *testing.T) 
 	msg := &HandshakeMsg{
 		Type:      HandshakeRequest,
 		NodeID:    42,
-		PublicKey: "new-key-should-be-ignored",
+		PublicKey: "original-key",
 		Timestamp: time.Now().Unix(),
 	}
 	hm.handleRequest(nil, msg, false) // conn is unused in body
 
-	// PublicKey should NOT have been overwritten (handleRequest for trusted peers
-	// is a no-op beyond emitting sendAcceptLocked).
+	// The record is left as-is (handleRequest for a trusted peer whose
+	// key still matches is a no-op beyond emitting sendAcceptLocked).
 	hm.mu.RLock()
 	rec := hm.trusted[42]
 	hm.mu.RUnlock()
+	if rec == nil {
+		t.Fatal("trusted[42] dropped for a request carrying the bound key")
+	}
 	if rec.PublicKey != "original-key" {
 		t.Fatalf("trusted[42].PublicKey mutated: got %q, want 'original-key'", rec.PublicKey)
 	}
 	if !rec.ApprovedAt.Equal(existingAt) {
 		t.Fatalf("trusted[42].ApprovedAt mutated: got %v, want %v", rec.ApprovedAt, existingAt)
+	}
+}
+
+// A request for an already-trusted node ID that carries a different key
+// is a different key holder behind a recycled node ID. The record is
+// dropped and the request falls through to the normal approval flow.
+func TestHandleRequestTrustedNodeWithDifferentKeyDropsRecord(t *testing.T) {
+	t.Parallel()
+	hm, _ := hsTestManager(t, false)
+	defer waitForGoRPCDrain()
+
+	hm.trusted[42] = &TrustRecord{
+		NodeID:     42,
+		PublicKey:  "original-key",
+		ApprovedAt: time.Now().Add(-1 * time.Hour),
+	}
+
+	msg := &HandshakeMsg{
+		Type:      HandshakeRequest,
+		NodeID:    42,
+		PublicKey: "reclaimed-key",
+		Timestamp: time.Now().Unix(),
+	}
+	hm.handleRequest(nil, msg, false)
+
+	hm.mu.RLock()
+	_, stillTrusted := hm.trusted[42]
+	_, nowPending := hm.pending[42]
+	hm.mu.RUnlock()
+
+	if stillTrusted {
+		t.Fatal("trusted[42] survived a request carrying a different public key")
+	}
+	if !nowPending {
+		t.Fatal("request from the new key holder should be queued for approval")
+	}
+}
+
+// A record persisted before keys were bound (or one whose registry
+// backfill never landed) keeps working, and adopts the first key it
+// sees.
+func TestHandleRequestUnboundLegacyRecordAdoptsKey(t *testing.T) {
+	t.Parallel()
+	hm, _ := hsTestManager(t, false)
+	defer waitForGoRPCDrain()
+
+	hm.trusted[42] = &TrustRecord{
+		NodeID:     42,
+		ApprovedAt: time.Now().Add(-1 * time.Hour),
+	}
+
+	msg := &HandshakeMsg{
+		Type:      HandshakeRequest,
+		NodeID:    42,
+		PublicKey: "first-seen-key",
+		Timestamp: time.Now().Unix(),
+	}
+	hm.handleRequest(nil, msg, false)
+
+	hm.mu.RLock()
+	rec := hm.trusted[42]
+	hm.mu.RUnlock()
+	if rec == nil {
+		t.Fatal("legacy unbound record was dropped — upgrades must not break existing trust")
+	}
+	if rec.PublicKey != "first-seen-key" {
+		t.Fatalf("legacy record did not adopt the presented key: got %q", rec.PublicKey)
 	}
 }
 
