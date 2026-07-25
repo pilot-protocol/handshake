@@ -42,6 +42,18 @@ type HandshakeMsg struct {
 }
 
 // TrustRecord holds information about a trusted peer.
+//
+// PublicKey is the peer key the record was established against, and is
+// what scopes the record: node IDs are recycled (reaped and re-claimed
+// by a different identity) and peers rotate keys, so a record only
+// describes the same counterparty for as long as the key behind the
+// node ID is unchanged. Checks that have the peer's current key in
+// scope go through IsTrustedWithKey, which compares the two.
+//
+// An empty PublicKey means "unbound": records restored from a snapshot
+// written before keys were recorded, and relay-established records
+// whose backfillPeerKey has not landed yet, both look like this. Those
+// stay trusted on node ID alone and adopt the first key that turns up.
 type TrustRecord struct {
 	NodeID     uint32
 	PublicKey  string // base64 Ed25519 pubkey
@@ -747,11 +759,15 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	// Already trusted?
+	// Already trusted? Only if the record still binds the key this
+	// request carries — otherwise it is dropped here and the request
+	// falls through to the normal approval paths below.
 	if _, ok := hm.trusted[peerNodeID]; ok {
-		slog.Debug("node already trusted", "peer_node_id", peerNodeID)
-		hm.sendAcceptLocked(peerNodeID)
-		return
+		if hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
+			slog.Debug("node already trusted", "peer_node_id", peerNodeID)
+			hm.sendAcceptLocked(peerNodeID)
+			return
+		}
 	}
 
 	// Check if we have an outgoing request to this peer (mutual handshake)
@@ -907,6 +923,22 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 			return
 		}
 		delete(hm.revoked, peerNodeID)
+	}
+
+	// An accept that carries a different key than the record we hold
+	// comes from a different key holder behind the same node ID. Drop
+	// the record instead of rebinding it — re-trusting is an explicit
+	// handshake, not a side effect of an inbound accept.
+	if existing, ok := hm.trusted[peerNodeID]; ok {
+		bound := existing.PublicKey
+		if !hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
+			delete(hm.outgoing, peerNodeID)
+			return
+		}
+		// Preserve an already-bound key when the accept omits one.
+		if msg.PublicKey == "" {
+			msg.PublicKey = bound
+		}
 	}
 
 	delete(hm.outgoing, peerNodeID)
@@ -1185,6 +1217,11 @@ func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
 // backfillPeerKey fetches a peer's public key from the registry and updates
 // the trust record. Called asynchronously after relay-based trust establishment,
 // where the P2P public key exchange didn't happen.
+//
+// It doubles as the binding check for relay-established records: an
+// unbound record adopts the registry key, and a record bound to some
+// other key is dropped, since the node ID now resolves to a different
+// identity than the one trust was granted to.
 func (hm *Manager) backfillPeerKey(peerNodeID uint32) {
 	reg := hm.rt.Registry()
 	if reg == nil {
@@ -1201,12 +1238,30 @@ func (hm *Manager) backfillPeerKey(peerNodeID uint32) {
 	}
 
 	hm.mu.Lock()
-	defer hm.mu.Unlock()
-	if rec, ok := hm.trusted[peerNodeID]; ok && rec.PublicKey == "" {
+	rec, ok := hm.trusted[peerNodeID]
+	if !ok {
+		hm.mu.Unlock()
+		return
+	}
+	if rec.PublicKey == "" {
 		rec.PublicKey = pubKeyB64
 		hm.markDirty()
+		hm.mu.Unlock()
 		slog.Debug("backfilled peer public key", "peer_node_id", peerNodeID)
+		return
 	}
+	if subtle.ConstantTimeCompare([]byte(rec.PublicKey), []byte(pubKeyB64)) == 1 {
+		hm.mu.Unlock()
+		return
+	}
+	delete(hm.trusted, peerNodeID)
+	hm.markDirty()
+	hm.mu.Unlock()
+
+	slog.Warn("dropping trust record: registry key differs from bound key", "peer_node_id", peerNodeID)
+	hm.rt.PublishEvent("trust.changed", map[string]interface{}{
+		"peer_node_id": peerNodeID, "state": "revoked", "reason": "key_changed",
+	})
 }
 
 // ProcessRelayedRejection handles a handshake rejection received via registry relay.
@@ -1394,11 +1449,124 @@ func (hm *Manager) handleRevokeMsg(msg *HandshakeMsg) {
 }
 
 // IsTrusted returns whether a peer has been approved.
+//
+// This answers the node-ID-only question, for call sites that have no
+// peer key in scope (outbound dials, for instance). Callers that do
+// know the key the peer is currently presenting should use
+// IsTrustedWithKey instead so the record's binding is enforced.
 func (hm *Manager) IsTrusted(nodeID uint32) bool {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
 	_, ok := hm.trusted[nodeID]
 	return ok
+}
+
+// IsTrustedWithKey returns whether a peer has been approved, given the
+// base64 Ed25519 key that peer currently presents (same encoding as
+// TrustRecord.PublicKey — crypto.EncodePublicKey).
+//
+// A record bound to a different key does not describe the peer behind
+// this node ID any more, so it is dropped and the answer is false; the
+// peer has to handshake again under its new key.
+//
+// Both unknowns degrade to IsTrusted rather than to a denial, so
+// upgrades and older peers keep their trust:
+//
+//   - currentKeyB64 empty — no key resolved at the call site.
+//   - record unbound — pre-binding snapshot or a not-yet-backfilled
+//     relay record. It adopts currentKeyB64 here, so the binding takes
+//     effect from the first check that resolves a key.
+//
+// The common case (bound key, matching) is served entirely under the
+// read lock; only adopting and dropping take the write lock.
+func (hm *Manager) IsTrustedWithKey(nodeID uint32, currentKeyB64 string) bool {
+	hm.mu.RLock()
+	rec, ok := hm.trusted[nodeID]
+	var bound string
+	if ok {
+		bound = rec.PublicKey
+	}
+	hm.mu.RUnlock()
+
+	if !ok {
+		return false
+	}
+	if currentKeyB64 == "" {
+		return true
+	}
+	if bound == "" {
+		hm.adoptPeerKey(nodeID, currentKeyB64)
+		return true
+	}
+	if subtle.ConstantTimeCompare([]byte(bound), []byte(currentKeyB64)) == 1 {
+		return true
+	}
+	hm.dropRebound(nodeID, bound)
+	return false
+}
+
+// adoptPeerKey binds keyB64 to an existing, still-unbound trust record.
+// No-op when the record has since gone away or been bound elsewhere.
+func (hm *Manager) adoptPeerKey(nodeID uint32, keyB64 string) {
+	hm.mu.Lock()
+	rec, ok := hm.trusted[nodeID]
+	if !ok || rec.PublicKey != "" {
+		hm.mu.Unlock()
+		return
+	}
+	rec.PublicKey = keyB64
+	hm.markDirty()
+	hm.mu.Unlock()
+	slog.Debug("bound peer public key to trust record", "peer_node_id", nodeID)
+}
+
+// dropRebound removes a trust record whose bound key no longer matches
+// the key the peer presents. staleKey is re-checked under the write lock
+// so a record re-established in the meantime is left alone.
+func (hm *Manager) dropRebound(nodeID uint32, staleKey string) {
+	hm.mu.Lock()
+	rec, ok := hm.trusted[nodeID]
+	if !ok || rec.PublicKey != staleKey {
+		hm.mu.Unlock()
+		return
+	}
+	delete(hm.trusted, nodeID)
+	hm.markDirty()
+	hm.mu.Unlock()
+
+	slog.Warn("dropping trust record: peer public key changed", "peer_node_id", nodeID)
+	hm.rt.PublishEvent("trust.changed", map[string]interface{}{
+		"peer_node_id": nodeID, "state": "revoked", "reason": "key_changed",
+	})
+}
+
+// reconcileTrustBindingLocked resolves an existing trust record against
+// the key a peer is presenting on an inbound handshake message, and
+// reports whether the record still stands. Same rules as
+// IsTrustedWithKey; separate because these call sites already hold
+// hm.mu write-locked. Caller MUST hold hm.mu.
+func (hm *Manager) reconcileTrustBindingLocked(nodeID uint32, currentKeyB64 string) bool {
+	rec, ok := hm.trusted[nodeID]
+	if !ok {
+		return false
+	}
+	if currentKeyB64 == "" || rec.PublicKey == "" {
+		if rec.PublicKey == "" && currentKeyB64 != "" {
+			rec.PublicKey = currentKeyB64
+			hm.markDirty()
+		}
+		return true
+	}
+	if subtle.ConstantTimeCompare([]byte(rec.PublicKey), []byte(currentKeyB64)) == 1 {
+		return true
+	}
+	delete(hm.trusted, nodeID)
+	hm.markDirty()
+	slog.Warn("dropping trust record: peer public key changed", "peer_node_id", nodeID)
+	hm.rt.PublishEvent("trust.changed", map[string]interface{}{
+		"peer_node_id": nodeID, "state": "revoked", "reason": "key_changed",
+	})
+	return false
 }
 
 // TrustedPeers returns all trusted peers.
