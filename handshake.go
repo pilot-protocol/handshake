@@ -500,6 +500,11 @@ func (hm *Manager) Start() error {
 // single bounded Read rather than io.ReadAll so we return as soon as the
 // message bytes land, without waiting for the sender to close the stream.
 func (hm *Manager) handleConnection(stream coreapi.Stream) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("handshake: recovered from panic in connection handler", "panic", r)
+		}
+	}()
 	const maxMsgSize = 64 * 1024
 
 	type readResult struct {
