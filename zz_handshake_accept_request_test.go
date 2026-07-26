@@ -372,7 +372,12 @@ func TestProcessMessageDispatchesHandshakeAccept(t *testing.T) {
 	t.Cleanup(hm.Stop)
 
 	// Omit PublicKey so processMessage skips the signature-required check
-	// and dispatches through the Type switch to handleAccept.
+	// and dispatches through the Type switch to handleAccept. The accept
+	// completes an outgoing request, so one has to be in flight.
+	hm.mu.Lock()
+	hm.outgoing[44] = time.Now()
+	hm.mu.Unlock()
+
 	msg := &HandshakeMsg{
 		Type:      HandshakeAccept,
 		NodeID:    44,

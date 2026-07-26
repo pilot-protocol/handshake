@@ -21,11 +21,18 @@ import (
 type mockStream struct {
 	data []byte
 	pos  int
-	err  error // returned immediately from Read when set
+	err  error        // returned immediately from Read when set
+	addr coreapi.Addr // reported by RemoteAddr
 }
 
 func newMockStreamData(data []byte) *mockStream { return &mockStream{data: data} }
 func newMockStreamErr(err error) *mockStream    { return &mockStream{err: err} }
+
+// newMockStreamFrom is newMockStreamData with an authenticated sender
+// node ID, as the transport would supply for a real peer connection.
+func newMockStreamFrom(node uint32, data []byte) *mockStream {
+	return &mockStream{data: data, addr: coreapi.Addr{Node: node}}
+}
 
 func (s *mockStream) Read(p []byte) (int, error) {
 	if s.err != nil {
@@ -42,7 +49,7 @@ func (s *mockStream) Write(p []byte) (int, error)      { return len(p), nil }
 func (s *mockStream) Close() error                     { return nil }
 func (s *mockStream) LocalAddr() coreapi.Addr          { return coreapi.Addr{} }
 func (s *mockStream) LocalPort() uint16                { return 0 }
-func (s *mockStream) RemoteAddr() coreapi.Addr         { return coreapi.Addr{} }
+func (s *mockStream) RemoteAddr() coreapi.Addr         { return s.addr }
 func (s *mockStream) RemotePort() uint16               { return 0 }
 func (s *mockStream) SetDeadline(time.Time) error      { return nil }
 func (s *mockStream) SetReadDeadline(time.Time) error  { return nil }
@@ -108,7 +115,7 @@ func TestHandleConnectionValidMsgDispatchesToProcessMessage(t *testing.T) {
 	}
 	raw, _ := json.Marshal(&msg)
 
-	stream := newMockStreamData(raw)
+	stream := newMockStreamFrom(321, raw)
 
 	done := make(chan struct{})
 	go func() {
@@ -190,8 +197,10 @@ func TestProcessMessageReplayCaughtOnSecondDispatch(t *testing.T) {
 		Timestamp: time.Now().Unix(),
 	}
 
+	stream := &addrStream{addr: coreapi.Addr{Node: 33}}
+
 	// First call: clean dispatch → outgoing[33] deleted + hash inserted in replaySet
-	hm.processMessage(nil, msg)
+	hm.processMessage(stream, msg)
 	hm.mu.RLock()
 	_, firstStillOut := hm.outgoing[33]
 	hm.mu.RUnlock()
@@ -204,7 +213,7 @@ func TestProcessMessageReplayCaughtOnSecondDispatch(t *testing.T) {
 	hm.mu.Unlock()
 
 	// Second call: replay detected → early return, outgoing[33] NOT mutated
-	hm.processMessage(nil, msg)
+	hm.processMessage(stream, msg)
 	hm.mu.RLock()
 	_, stillOut := hm.outgoing[33]
 	hm.mu.RUnlock()

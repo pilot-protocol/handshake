@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pilot-protocol/common/coreapi"
 	"github.com/pilot-protocol/common/crypto"
 )
 
@@ -39,7 +40,7 @@ func TestPPA008_SignedMessageReStampedIsDeduped(t *testing.T) {
 	hm.mu.Lock()
 	hm.outgoing[peer] = time.Now()
 	hm.mu.Unlock()
-	hm.processMessage(nil, first)
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: peer}}, first)
 
 	hm.mu.RLock()
 	_, clearedByFirst := hm.outgoing[peer]
@@ -59,7 +60,7 @@ func TestPPA008_SignedMessageReStampedIsDeduped(t *testing.T) {
 		Signature: sig,
 		Timestamp: first.Timestamp + 7,
 	}
-	hm.processMessage(nil, reStamped)
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: peer}}, reStamped)
 
 	hm.mu.RLock()
 	_, stillOutgoing := hm.outgoing[peer]
@@ -80,8 +81,8 @@ func TestPPA008_DistinctSendersGetDistinctReplayKeys(t *testing.T) {
 	hm.mu.Unlock()
 
 	ts := time.Now().Unix()
-	hm.processMessage(nil, &HandshakeMsg{Type: HandshakeReject, NodeID: 11, Timestamp: ts})
-	hm.processMessage(nil, &HandshakeMsg{Type: HandshakeReject, NodeID: 22, Timestamp: ts})
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 11}}, &HandshakeMsg{Type: HandshakeReject, NodeID: 11, Timestamp: ts})
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 22}}, &HandshakeMsg{Type: HandshakeReject, NodeID: 22, Timestamp: ts})
 
 	hm.mu.RLock()
 	_, out11 := hm.outgoing[11]

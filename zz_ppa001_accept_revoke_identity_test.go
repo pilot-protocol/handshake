@@ -64,6 +64,10 @@ func TestPPA001_HonestAcceptOverMatchingStreamTrusts(t *testing.T) {
 	hm, _ := newBoundHM(t, 1)
 
 	const peer = uint32(500)
+	hm.mu.Lock()
+	hm.outgoing[peer] = time.Now()
+	hm.mu.Unlock()
+
 	msg := &HandshakeMsg{
 		Type:      HandshakeAccept,
 		NodeID:    peer,

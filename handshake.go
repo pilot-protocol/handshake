@@ -79,6 +79,7 @@ const (
 	handshakeRecvTimeout  = 10 * time.Second       // time to wait for handshake message
 	handshakeCloseDelay   = 500 * time.Millisecond // delay before closing after send to let data flush
 	maxReplaySetEntries   = 8192                   // cap replay set to prevent unbounded growth between reaps
+	maxReplayPerPeer      = 256                    // cap replay entries attributable to any single peer
 	maxPendingHandshakes  = 256                    // cap pending (unapproved) handshake requests
 	maxPendingPerSource   = 16
 	maxJustificationLen   = 1024
@@ -91,6 +92,14 @@ const (
 	// unboundedly under sustained inbound handshake pressure.
 	pendingHandshakeTTL = 30 * 24 * time.Hour
 )
+
+// replayEntry is one recorded handshake message hash: when it was first
+// accepted, and which peer node ID it was attributed to. The peer field
+// backs the per-peer accounting in recordReplay.
+type replayEntry struct {
+	seen time.Time
+	peer uint32
+}
 
 // Manager handles the trust handshake protocol on port 444.
 type Manager struct {
@@ -111,8 +120,9 @@ type Manager struct {
 	done            chan struct{}        // closed in Stop to signal drain goroutine exit
 
 	// Replay protection
-	replayMu  sync.Mutex
-	replaySet map[[32]byte]time.Time // message hash → first seen
+	replayMu   sync.Mutex
+	replaySet  map[[32]byte]replayEntry // message hash → first seen + attributed peer
+	replayPeer map[uint32]int           // peer → number of entries it holds in replaySet
 
 	// WaitForTrust notification: per-node list of channels closed when trust
 	// transitions to granted. Separate mu from hm.mu (always taken AFTER hm.mu)
@@ -132,7 +142,8 @@ func NewManager(rt Runtime) *Manager {
 		pendingBySource: make(map[uint32]int),
 		outgoing:        make(map[uint32]time.Time),
 		revoked:         make(map[uint32]time.Time),
-		replaySet:       make(map[[32]byte]time.Time),
+		replaySet:       make(map[[32]byte]replayEntry),
+		replayPeer:      make(map[uint32]int),
 		trustWaiters:    make(map[uint32][]chan struct{}),
 		dirty:           make(chan struct{}, 1),
 		done:            make(chan struct{}),
@@ -570,21 +581,15 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 		return
 	}
 
+	// The replay set is consulted here but only written after the message
+	// has cleared authentication below, so an unauthenticated sender
+	// cannot consume replay-set capacity on behalf of a peer.
 	replayChallenge := fmt.Sprintf("handshake:%d:%d", msg.NodeID, hm.rt.NodeID())
 	msgHash := sha256.Sum256([]byte(msg.Type + "\x00" + replayChallenge + "\x00" + msg.Signature))
-	hm.replayMu.Lock()
-	if _, seen := hm.replaySet[msgHash]; seen {
-		hm.replayMu.Unlock()
+	if hm.replaySeen(msgHash) {
 		slog.Warn("handshake replay detected", "peer_node_id", msg.NodeID)
 		return
 	}
-	if len(hm.replaySet) >= maxReplaySetEntries {
-		hm.replayMu.Unlock()
-		slog.Warn("handshake replay set full, rejecting", "peer_node_id", msg.NodeID)
-		return
-	}
-	hm.replaySet[msgHash] = now
-	hm.replayMu.Unlock()
 
 	// M12 fix: verify P2P signature if the sender provides a public key
 	registryBound := false
@@ -632,16 +637,27 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 		}
 	}
 
-	if msg.Type == HandshakeAccept || msg.Type == HandshakeRevoke {
+	// accept / reject / revoke all act on existing local state (they grant
+	// trust, cancel an outgoing request, or drop trust), so each must
+	// arrive on a transport whose authenticated node ID matches the
+	// claimed sender. Only request creates fresh state and is exempt.
+	if msg.Type == HandshakeAccept || msg.Type == HandshakeRevoke || msg.Type == HandshakeReject {
 		if stream == nil || stream.RemoteAddr().Node != msg.NodeID {
 			var authenticated uint32
 			if stream != nil {
 				authenticated = stream.RemoteAddr().Node
 			}
-			slog.Warn("handshake: accept/revoke node_id does not match authenticated sender, rejecting",
+			slog.Warn("handshake: accept/reject/revoke node_id does not match authenticated sender, rejecting",
 				"claimed_node_id", msg.NodeID, "authenticated_node_id", authenticated, "type", msg.Type)
 			return
 		}
+	}
+
+	// Message is authenticated: record it so an identical copy replayed
+	// later is dropped by the replaySeen check above.
+	if !hm.recordReplay(msg.NodeID, msgHash, now) {
+		slog.Warn("handshake replay detected", "peer_node_id", msg.NodeID)
+		return
 	}
 
 	switch msg.Type {
@@ -656,14 +672,101 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 	}
 }
 
+// replaySeen reports whether msgHash is already recorded.
+func (hm *Manager) replaySeen(msgHash [32]byte) bool {
+	hm.replayMu.Lock()
+	defer hm.replayMu.Unlock()
+	_, seen := hm.replaySet[msgHash]
+	return seen
+}
+
+// recordReplay stores msgHash against peerNodeID. Returns false when the
+// hash was already present (the message is a duplicate).
+//
+// Capacity is enforced by eviction, not refusal. A peer that already
+// holds maxReplayPerPeer entries displaces its own oldest entry, so one
+// talkative peer cannot crowd out the rest. When the whole set is at
+// maxReplaySetEntries, expired entries are dropped first and the
+// globally oldest entry after that. Recording therefore always succeeds
+// for a message that is not itself a duplicate.
+func (hm *Manager) recordReplay(peerNodeID uint32, msgHash [32]byte, now time.Time) bool {
+	hm.replayMu.Lock()
+	defer hm.replayMu.Unlock()
+
+	if _, seen := hm.replaySet[msgHash]; seen {
+		return false
+	}
+	for hm.replayPeer[peerNodeID] >= maxReplayPerPeer {
+		if !hm.evictOldestReplayLocked(peerNodeID, true) {
+			break
+		}
+	}
+	if len(hm.replaySet) >= maxReplaySetEntries {
+		hm.reapReplayLocked(now)
+	}
+	for len(hm.replaySet) >= maxReplaySetEntries {
+		if !hm.evictOldestReplayLocked(0, false) {
+			break
+		}
+	}
+
+	hm.replaySet[msgHash] = replayEntry{seen: now, peer: peerNodeID}
+	hm.replayPeer[peerNodeID]++
+	return true
+}
+
+// evictOldestReplayLocked drops the oldest replay entry, restricted to
+// entries attributed to peerNodeID when scoped is true. Reports whether
+// an entry was removed. Caller MUST hold replayMu.
+func (hm *Manager) evictOldestReplayLocked(peerNodeID uint32, scoped bool) bool {
+	var (
+		oldestHash [32]byte
+		oldestSeen time.Time
+		found      bool
+	)
+	for hash, e := range hm.replaySet {
+		if scoped && e.peer != peerNodeID {
+			continue
+		}
+		if !found || e.seen.Before(oldestSeen) {
+			oldestHash, oldestSeen, found = hash, e.seen, true
+		}
+	}
+	if !found {
+		return false
+	}
+	hm.deleteReplayLocked(oldestHash)
+	return true
+}
+
+// deleteReplayLocked removes one entry and keeps the per-peer counter in
+// step. Caller MUST hold replayMu.
+func (hm *Manager) deleteReplayLocked(hash [32]byte) {
+	e, ok := hm.replaySet[hash]
+	if !ok {
+		return
+	}
+	delete(hm.replaySet, hash)
+	if hm.replayPeer[e.peer] <= 1 {
+		delete(hm.replayPeer, e.peer)
+		return
+	}
+	hm.replayPeer[e.peer]--
+}
+
 // reapReplay removes expired entries from the replay set.
 func (hm *Manager) reapReplay() {
 	hm.replayMu.Lock()
 	defer hm.replayMu.Unlock()
-	threshold := time.Now().Add(-2 * handshakeMaxAge)
-	for hash, seen := range hm.replaySet {
-		if seen.Before(threshold) {
-			delete(hm.replaySet, hash)
+	hm.reapReplayLocked(time.Now())
+}
+
+// reapReplayLocked is reapReplay's body. Caller MUST hold replayMu.
+func (hm *Manager) reapReplayLocked(now time.Time) {
+	threshold := now.Add(-2 * handshakeMaxAge)
+	for hash, e := range hm.replaySet {
+		if e.seen.Before(threshold) {
+			hm.deleteReplayLocked(hash)
 		}
 	}
 }
@@ -833,7 +936,10 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	// into auto-accept.
 	if registryBound {
 		// Trust gate via L10 TrustChecker. Nil → trust nothing.
-		name, ok := hm.rt.IsTrusted(peerNodeID)
+		// msg.PublicKey is the key the peer authenticated with and that
+		// the registry lookup bound to peerNodeID, so it is the key the
+		// allowlist pin is checked against.
+		name, ok := hm.trustedAgentName(peerNodeID, msg.PublicKey)
 		if ok {
 			hm.markTrustedLocked(peerNodeID, &TrustRecord{
 				NodeID:     peerNodeID,
@@ -908,6 +1014,11 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 }
 
 // handleAccept processes a handshake acceptance from a peer.
+//
+// An acceptance only completes a handshake this node started: it is
+// matched against, and consumes, the hm.outgoing entry created by
+// SendRequest. Accepts with no matching entry are dropped, mirroring
+// processRelayedApproval's precondition on the relay path.
 func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 	peerNodeID := msg.NodeID
 	slog.Info("handshake accepted by peer", "peer_node_id", peerNodeID)
@@ -923,6 +1034,13 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 			return
 		}
 		delete(hm.revoked, peerNodeID)
+	}
+
+	// Trust follows a request we actually made: an accept with no
+	// matching outgoing entry is unsolicited and is dropped.
+	if _, ok := hm.outgoing[peerNodeID]; !ok {
+		slog.Warn("dropping handshake acceptance with no matching outgoing request", "peer_node_id", peerNodeID)
+		return
 	}
 
 	// An accept that carries a different key than the record we hold
@@ -1089,7 +1207,10 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 	// Auto-approve when the sender is in the embedded trusted-agents list.
 	// The registry relay vouches for the sender's node_id (only authenticated
 	// nodes can relay), so no separate registryBound check is needed here.
-	if name, ok := hm.rt.IsTrusted(fromNodeID); ok {
+	//
+	// The relay carries no peer public key, so the empty key is passed:
+	// allowlist entries that carry a pin do not match on this path.
+	if name, ok := hm.trustedAgentName(fromNodeID, ""); ok {
 		hm.markTrustedLocked(fromNodeID, &TrustRecord{
 			NodeID:     fromNodeID,
 			ApprovedAt: time.Now(),
@@ -1446,6 +1567,17 @@ func (hm *Manager) handleRevokeMsg(msg *HandshakeMsg) {
 			hm.goRPC(func() { reg.RevokeTrust(selfID, peerNodeID) })
 		}
 	}
+}
+
+// trustedAgentName consults the allowlist gate for peerNodeID, passing
+// the authenticated peer key when the Runtime implements the key-bound
+// form. Runtimes that only implement IsTrusted keep the node-ID-only
+// answer.
+func (hm *Manager) trustedAgentName(peerNodeID uint32, pubKeyB64 string) (string, bool) {
+	if kc, ok := hm.rt.(KeyedTrustChecker); ok {
+		return kc.IsTrustedWithKey(peerNodeID, pubKeyB64)
+	}
+	return hm.rt.IsTrusted(peerNodeID)
 }
 
 // IsTrusted returns whether a peer has been approved.
