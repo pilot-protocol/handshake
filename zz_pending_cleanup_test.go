@@ -27,7 +27,8 @@ func TestMarkTrustedClearsPending(t *testing.T) {
 		pending:      make(map[uint32]*PendingHandshake),
 		outgoing:     make(map[uint32]time.Time),
 		revoked:      make(map[uint32]time.Time),
-		replaySet:    make(map[[32]byte]time.Time),
+		replaySet:    make(map[[32]byte]replayEntry),
+		replayPeer:   make(map[uint32]int),
 		trustWaiters: make(map[uint32][]chan struct{}),
 	}
 
@@ -55,7 +56,8 @@ func TestMarkTrustedClearsOutgoing(t *testing.T) {
 		pending:      make(map[uint32]*PendingHandshake),
 		outgoing:     make(map[uint32]time.Time),
 		revoked:      make(map[uint32]time.Time),
-		replaySet:    make(map[[32]byte]time.Time),
+		replaySet:    make(map[[32]byte]replayEntry),
+		replayPeer:   make(map[uint32]int),
 		trustWaiters: make(map[uint32][]chan struct{}),
 	}
 
@@ -80,7 +82,8 @@ func TestMarkTrustedClearsBothMaps(t *testing.T) {
 		pending:      make(map[uint32]*PendingHandshake),
 		outgoing:     make(map[uint32]time.Time),
 		revoked:      make(map[uint32]time.Time),
-		replaySet:    make(map[[32]byte]time.Time),
+		replaySet:    make(map[[32]byte]replayEntry),
+		replayPeer:   make(map[uint32]int),
 		trustWaiters: make(map[uint32][]chan struct{}),
 	}
 
@@ -113,7 +116,8 @@ func TestMarkTrustedNoEntryIsIdempotent(t *testing.T) {
 		pending:      make(map[uint32]*PendingHandshake),
 		outgoing:     make(map[uint32]time.Time),
 		revoked:      make(map[uint32]time.Time),
-		replaySet:    make(map[[32]byte]time.Time),
+		replaySet:    make(map[[32]byte]replayEntry),
+		replayPeer:   make(map[uint32]int),
 		trustWaiters: make(map[uint32][]chan struct{}),
 	}
 

@@ -89,6 +89,21 @@ type Runtime interface {
 	Registry() RegistryClient
 }
 
+// KeyedTrustChecker is the key-bound form of Runtime.IsTrusted. It is
+// an optional extension: the handshake manager type-asserts its Runtime
+// for it and falls back to IsTrusted when the adapter does not provide
+// it, so existing Runtime implementations keep compiling unchanged.
+//
+// pubKeyB64 is the base64 Ed25519 key the peer proved possession of on
+// this handshake, or "" when no authenticated key is in scope (the
+// registry-relayed path). Implementations that carry a pinned key for
+// the node MUST require an exact match and MUST treat "" as a miss;
+// entries with no pin answer the node-ID-only question, matching
+// IsTrusted.
+type KeyedTrustChecker interface {
+	IsTrustedWithKey(nodeID uint32, pubKeyB64 string) (name string, ok bool)
+}
+
 // RegistryClient is the subset of pkg/registry/client.Client the
 // handshake manager uses. Defined here as an interface so the manager
 // stays free of import cycles and tests can supply a fake.

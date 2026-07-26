@@ -155,8 +155,9 @@ func TestReapReplayRemovesStaleEntriesKeepsFresh(t *testing.T) {
 	stale := [32]byte{1}
 	fresh := [32]byte{2}
 	hm.replayMu.Lock()
-	hm.replaySet[stale] = time.Now().Add(-24 * time.Hour)
-	hm.replaySet[fresh] = time.Now()
+	hm.replaySet[stale] = replayEntry{seen: time.Now().Add(-24 * time.Hour), peer: 1}
+	hm.replaySet[fresh] = replayEntry{seen: time.Now(), peer: 1}
+	hm.replayPeer[1] = 2
 	hm.replayMu.Unlock()
 
 	hm.reapReplay()

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/pilot-protocol/common/coreapi"
 )
 
 // This file targets every coverage hole identified by the iter-baseline
@@ -522,16 +524,17 @@ func TestReapStalePending_PersistsViaSaveTrust(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// processMessage: replay set FULL — second message past the cap is dropped
+// processMessage: a full replay set evicts rather than dropping the
+// message, and stays at the cap
 // -----------------------------------------------------------------------
 
-func TestProcessMessage_ReplaySetFullDropsNewMessages(t *testing.T) {
+func TestProcessMessage_ReplaySetFullStillDispatches(t *testing.T) {
 	t.Parallel()
 	hm := newTestHM(t, "")
 	t.Cleanup(hm.Stop)
 
-	// Fill the replay set to exactly the cap so the next message hits the
-	// "set full" branch.
+	// Fill the replay set to exactly the cap, spread across many peers so
+	// no single peer is over its own limit.
 	hm.replayMu.Lock()
 	for i := 0; i < maxReplaySetEntries; i++ {
 		var h [32]byte
@@ -540,7 +543,9 @@ func TestProcessMessage_ReplaySetFullDropsNewMessages(t *testing.T) {
 		h[1] = byte(i >> 8)
 		h[2] = byte(i >> 16)
 		h[3] = byte(i >> 24)
-		hm.replaySet[h] = time.Now()
+		peer := uint32(1000 + i)
+		hm.replaySet[h] = replayEntry{seen: time.Now(), peer: peer}
+		hm.replayPeer[peer]++
 	}
 	hm.replayMu.Unlock()
 
@@ -550,15 +555,22 @@ func TestProcessMessage_ReplaySetFullDropsNewMessages(t *testing.T) {
 		Reason:    "test",
 		Timestamp: time.Now().Unix(),
 	}
-	// Seed an outgoing entry so a dispatch would be observable.
+	// Seed an outgoing entry so the dispatch is observable.
 	hm.outgoing[77] = time.Now()
-	hm.processMessage(nil, msg)
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 77}}, msg)
 
 	hm.mu.RLock()
 	_, stillOut := hm.outgoing[77]
 	hm.mu.RUnlock()
-	if !stillOut {
-		t.Fatal("replay-set-full path must early-return — outgoing[77] should be preserved")
+	if stillOut {
+		t.Fatal("a full replay set must not block an authenticated message — outgoing[77] should have been cleared")
+	}
+
+	hm.replayMu.Lock()
+	size := len(hm.replaySet)
+	hm.replayMu.Unlock()
+	if size > maxReplaySetEntries {
+		t.Fatalf("replay set grew past the cap: %d > %d", size, maxReplaySetEntries)
 	}
 }
 
