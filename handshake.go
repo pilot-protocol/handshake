@@ -528,6 +528,38 @@ func (hm *Manager) handleConnection(stream coreapi.Stream) {
 			slog.Error("handshake: recovered from panic in connection handler", "panic", r)
 		}
 	}()
+
+	// Close the stream on every exit path. Nothing closed it before — Close
+	// appeared nowhere in this file — so each accepted connection leaked:
+	//
+	//   * on the timeout branch below, the reader goroutine stays parked in
+	//     stream.Read forever, retaining its 64 KiB buf, the stream, and the
+	//     underlying daemon Connection (RecvBuf/SendBuf channels). Only a
+	//     Close can unblock it, and there wasn't one.
+	//   * on the success path the daemon-side Connection was never released
+	//     either.
+	//
+	// Port 444 accepts from any peer, so a peer that connects and sends
+	// nothing leaked ~64 KiB plus a goroutine stack and a full Connection
+	// every handshakeRecvTimeout, uncapped. That is the same shape as the
+	// dead idle-timeout that OOM-killed the service fleet.
+	//
+	// Closing here is what frees the parked reader: Close ends at
+	// CloseConnection, which closes RecvBuf, so the blocked receive returns
+	// !ok and the goroutine exits with io.EOF.
+	//
+	// The handshakeCloseDelay pause is why that constant exists — it was
+	// declared for exactly this ("delay before closing after send to let
+	// data flush") and had no remaining reference, stranded when the close
+	// path was removed. processMessage writes its reply synchronously, so
+	// without the pause we would close from under an in-flight response.
+	// Each handleConnection already runs in its own goroutine (see the
+	// accept loop), so this delays nothing but its own teardown.
+	defer func() {
+		time.Sleep(handshakeCloseDelay)
+		_ = stream.Close()
+	}()
+
 	const maxMsgSize = 64 * 1024
 
 	type readResult struct {
