@@ -4,6 +4,7 @@ package handshake
 
 import (
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -194,7 +195,8 @@ func TestTrustedPeers_ReturnsAllEntries(t *testing.T) {
 // -----------------------------------------------------------------------
 
 type slowStream struct {
-	done chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func newSlowStream() *slowStream { return &slowStream{done: make(chan struct{})} }
@@ -203,11 +205,24 @@ func (s *slowStream) Read(p []byte) (int, error) {
 	<-s.done
 	return 0, io.EOF
 }
-func (s *slowStream) Write(p []byte) (int, error)      { return len(p), nil }
-func (s *slowStream) Close() error                     { close(s.done); return nil }
-func (s *slowStream) LocalAddr() coreapi.Addr           { return coreapi.Addr{} }
+func (s *slowStream) Write(p []byte) (int, error) { return len(p), nil }
+
+// Close is idempotent, matching the real transport. The production
+// *Connection guards teardown with a sync.Once (CloseRecvBuf →
+// c.CloseOnce.Do), so calling Close twice is safe there. This double
+// stood in for it with a bare close(s.done), which panics on the second
+// call — so once handleConnection started closing the stream itself (as
+// it must, or every accepted connection leaks a goroutine), the test's
+// own `defer stream.Close()` became a second close and paniced.
+//
+// The bug was in the double's fidelity, not in closing twice.
+func (s *slowStream) Close() error {
+	s.closeOnce.Do(func() { close(s.done) })
+	return nil
+}
+func (s *slowStream) LocalAddr() coreapi.Addr          { return coreapi.Addr{} }
 func (s *slowStream) LocalPort() uint16                { return 0 }
-func (s *slowStream) RemoteAddr() coreapi.Addr          { return coreapi.Addr{} }
+func (s *slowStream) RemoteAddr() coreapi.Addr         { return coreapi.Addr{} }
 func (s *slowStream) RemotePort() uint16               { return 0 }
 func (s *slowStream) SetDeadline(time.Time) error      { return nil }
 func (s *slowStream) SetReadDeadline(time.Time) error  { return nil }
@@ -317,4 +332,3 @@ func TestSaveTrust_MkdirAllErrorIsNonFatal(t *testing.T) {
 	hm.mu.Unlock()
 	hm.saveTrust() // logs error, must not panic
 }
-
