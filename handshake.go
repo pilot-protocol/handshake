@@ -895,6 +895,32 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	hm.rt.PublishEvent("handshake.received", map[string]interface{}{
 		"peer_node_id": peerNodeID, "justification": justification,
 	})
+
+	// Fast pre-checks BEFORE the action hook, which in managed-enforce mode
+	// makes a synchronous authority round-trip. Without this, an attacker who
+	// can reach port 444 (or relay a request) forces one authority call per
+	// handshake and ties up a handler goroutine — and the anti-flood caps,
+	// evaluated only after the hook, don't protect the authority. Here an
+	// already-trusted peer (no new trust needed) and over-cap spam are handled
+	// without invoking the hook. The authoritative trust/cap decisions are
+	// still made under the lock below, so this is a guard, not the enforcement.
+	hm.mu.Lock()
+	if _, ok := hm.trusted[peerNodeID]; ok && hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
+		hm.sendAcceptLocked(peerNodeID)
+		hm.mu.Unlock()
+		slog.Debug("node already trusted (pre-hook fast path)", "peer_node_id", peerNodeID)
+		return
+	}
+	if _, exists := hm.pending[peerNodeID]; !exists {
+		if len(hm.pending) >= maxPendingHandshakes ||
+			(source != 0 && hm.pendingBySource[source] >= maxPendingPerSource) {
+			hm.mu.Unlock()
+			slog.Warn("handshake rejected before control hook: pending queue full", "peer_node_id", peerNodeID, "source", source)
+			return
+		}
+	}
+	hm.mu.Unlock()
+
 	autoAttempt, autoErr := hm.prepareTrustAction("trust.auto_accept", peerNodeID, "inbound", "incoming_request", true, justification != "")
 	autoAllowed := autoErr == nil
 	if autoErr != nil {
@@ -1244,6 +1270,23 @@ func (hm *Manager) ProcessRelayedRequest(fromNodeID uint32, justification string
 // processRelayedRequest handles a handshake request received via registry relay.
 func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string) {
 	justification = sanitizeJustification(justification)
+
+	// Bound authority round-trips from relayed handshake spam: an unknown peer
+	// whose request can neither be queued (pending cap full) nor short-circuited
+	// (not already trusted) is rejected BEFORE the managed action hook makes its
+	// authority call. Already-trusted or already-pending peers are never dropped
+	// here — they fall through to the existing handling below, where the caps
+	// are authoritatively enforced.
+	hm.mu.Lock()
+	_, alreadyTrusted := hm.trusted[fromNodeID]
+	_, alreadyPending := hm.pending[fromNodeID]
+	overCap := !alreadyPending && len(hm.pending) >= maxPendingHandshakes
+	hm.mu.Unlock()
+	if !alreadyTrusted && overCap {
+		slog.Warn("relayed handshake rejected before control hook: pending queue full", "peer_node_id", fromNodeID)
+		return
+	}
+
 	autoAttempt, autoErr := hm.prepareTrustAction("trust.auto_accept", fromNodeID, "inbound_relay", "incoming_request", true, justification != "")
 	autoAllowed := autoErr == nil
 	if autoErr != nil {
