@@ -47,16 +47,21 @@ func TestSendRequestDirectFailsRelaySucceeds(t *testing.T) {
 	hm, rt := hsTestManager(t, false)
 	// Sign registry operations with the self-identity so PollHandshakes /
 	// RequestHandshake succeed registry-side.
-	rt.regClient.SetSigner(func(challenge string) string {
-		return base64.StdEncoding.EncodeToString(rt.identity.Sign([]byte(challenge)))
-	})
-
 	// Register a peer so the registry has a valid to-node for the handshake.
+	// Registration now proves possession of the public key being registered,
+	// so use the peer identity for that operation and then restore the local
+	// node signer used by authenticated relay calls.
 	peerID, _ := crypto.GenerateIdentity()
+	rt.regClient.SetSigner(func(challenge string) string {
+		return base64.StdEncoding.EncodeToString(peerID.Sign([]byte(challenge)))
+	})
 	resp, err := rt.regClient.RegisterWithKey("127.0.0.1:0", crypto.EncodePublicKey(peerID.PublicKey), "", nil)
 	if err != nil {
 		t.Fatalf("register peer: %v", err)
 	}
+	rt.regClient.SetSigner(func(challenge string) string {
+		return base64.StdEncoding.EncodeToString(rt.identity.Sign([]byte(challenge)))
+	})
 	peerNodeID := uint32(resp["node_id"].(float64))
 
 	// SendRequest: direct sendMessage will fail (testRuntime.DialAndSend
