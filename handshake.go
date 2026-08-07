@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/pilot-protocol/common/actionhook"
 	"github.com/pilot-protocol/common/coreapi"
 	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/fsutil"
@@ -129,6 +130,10 @@ type Manager struct {
 	// so that markTrustedLocked can fire notifications while holding hm.mu.
 	trustWaitersMu sync.Mutex
 	trustWaiters   map[uint32][]chan struct{}
+
+	// actionHook is nil unless the composition root explicitly attaches an
+	// enterprise action profile. Nil is the compatibility default.
+	actionHook ActionHook
 }
 
 // NewManager constructs a Manager bound to the given Runtime. Loads
@@ -891,6 +896,52 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 		"peer_node_id": peerNodeID, "justification": justification,
 	})
 
+	// Fast pre-checks BEFORE the action hook, which in managed-enforce mode
+	// makes a synchronous authority round-trip. Without this, an attacker who
+	// can reach port 444 (or relay a request) forces one authority call per
+	// handshake and ties up a handler goroutine — and the anti-flood caps,
+	// evaluated only after the hook, don't protect the authority. Here an
+	// already-trusted peer (no new trust needed) and over-cap spam are handled
+	// without invoking the hook. The authoritative trust/cap decisions are
+	// still made under the lock below, so this is a guard, not the enforcement.
+	hm.mu.Lock()
+	if _, ok := hm.trusted[peerNodeID]; ok && hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
+		hm.sendAcceptLocked(peerNodeID)
+		hm.mu.Unlock()
+		slog.Debug("node already trusted (pre-hook fast path)", "peer_node_id", peerNodeID)
+		return
+	}
+	if _, exists := hm.pending[peerNodeID]; !exists {
+		if len(hm.pending) >= maxPendingHandshakes ||
+			(source != 0 && hm.pendingBySource[source] >= maxPendingPerSource) {
+			hm.mu.Unlock()
+			slog.Warn("handshake rejected before control hook: pending queue full", "peer_node_id", peerNodeID, "source", source)
+			return
+		}
+	}
+	hm.mu.Unlock()
+
+	autoAttempt, autoErr := hm.prepareTrustAction("trust.auto_accept", peerNodeID, "inbound", "incoming_request", true, justification != "")
+	autoAllowed := autoErr == nil
+	if autoErr != nil {
+		slog.Info("automatic trust acceptance blocked", "peer_node_id", peerNodeID, "error", autoErr)
+		hm.rt.PublishEvent("handshake.control_blocked", map[string]interface{}{
+			"peer_node_id": peerNodeID, "action": "trust.auto_accept",
+		})
+	}
+	autoExecuted := false
+	autoReason := "candidate_not_used"
+	defer func() {
+		if autoAttempt == nil {
+			return
+		}
+		if autoExecuted {
+			autoAttempt.complete(actionhook.StatusSucceeded, "", map[string]string{"grant_reason": autoReason})
+			return
+		}
+		autoAttempt.complete(actionhook.StatusSkipped, "", map[string]string{"skip_reason": autoReason})
+	}()
+
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
@@ -908,7 +959,7 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	// Check if we have an outgoing request to this peer (mutual handshake)
 	// SEC-038: mutual auto-trust is gated on registryBound so a peer
 	// cannot claim any NodeID with their own keypair and slip into trust.
-	if _, ok := hm.outgoing[peerNodeID]; ok && registryBound {
+	if _, ok := hm.outgoing[peerNodeID]; ok && registryBound && autoAllowed {
 		// Mutual! Auto-approve (registry confirmed pubkey binding)
 		delete(hm.outgoing, peerNodeID)
 		hm.markTrustedLocked(peerNodeID, &TrustRecord{
@@ -917,6 +968,7 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 			ApprovedAt: time.Now(),
 			Mutual:     true,
 		})
+		autoExecuted, autoReason = true, "mutual"
 		slog.Info("mutual handshake auto-approved", "peer_node_id", peerNodeID)
 		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
 			"peer_node_id": peerNodeID, "reason": "mutual",
@@ -937,13 +989,14 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	// Check if peers are on the same network (network trust)
 	// SEC-038: same-network auto-trust is gated on registryBound so a
 	// peer cannot claim any NodeID with their own keypair and slip into trust.
-	if hm.sameNetwork(peerNodeID) && registryBound {
+	if hm.sameNetwork(peerNodeID) && registryBound && autoAllowed {
 		hm.markTrustedLocked(peerNodeID, &TrustRecord{
 			NodeID:     peerNodeID,
 			PublicKey:  msg.PublicKey,
 			ApprovedAt: time.Now(),
 			Network:    hm.sharedNetwork(peerNodeID),
 		})
+		autoExecuted, autoReason = true, "same_network"
 		slog.Info("same network handshake auto-approved", "peer_node_id", peerNodeID)
 		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
 			"peer_node_id": peerNodeID, "reason": "same_network",
@@ -966,7 +1019,7 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	// registryBound a peer could claim any node ID with their own
 	// pubkey, sign with their own key, pass signature verify, and slip
 	// into auto-accept.
-	if registryBound {
+	if registryBound && autoAllowed {
 		// Trust gate via L10 TrustChecker. Nil → trust nothing.
 		// msg.PublicKey is the key the peer authenticated with and that
 		// the registry lookup bound to peerNodeID, so it is the key the
@@ -978,6 +1031,7 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 				PublicKey:  msg.PublicKey,
 				ApprovedAt: time.Now(),
 			})
+			autoExecuted, autoReason = true, "trusted_agent"
 			slog.Info("handshake auto-approved (trusted agent)",
 				"peer_node_id", peerNodeID, "agent", name)
 			hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
@@ -997,13 +1051,14 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	}
 
 	// Auto-approve all requests when the daemon is configured to do so.
-	if hm.rt.TrustAutoApprove() {
+	if hm.rt.TrustAutoApprove() && autoAllowed {
 		hm.markTrustedLocked(peerNodeID, &TrustRecord{
 			NodeID:     peerNodeID,
 			PublicKey:  msg.PublicKey,
 			ApprovedAt: time.Now(),
 			Mutual:     false,
 		})
+		autoExecuted, autoReason = true, "auto_approve"
 		slog.Info("handshake auto-approved (trust-auto-approve enabled)", "peer_node_id", peerNodeID)
 		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
 			"peer_node_id": peerNodeID, "reason": "auto_approve",
@@ -1054,6 +1109,23 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 	peerNodeID := msg.NodeID
 	slog.Info("handshake accepted by peer", "peer_node_id", peerNodeID)
+	attempt, actionErr := hm.prepareTrustAction("trust.accept", peerNodeID, "outbound_completion", "peer_acceptance", true, false)
+	if actionErr != nil {
+		slog.Info("trust establishment from peer acceptance blocked", "peer_node_id", peerNodeID, "error", actionErr)
+		hm.rt.PublishEvent("handshake.control_blocked", map[string]interface{}{
+			"peer_node_id": peerNodeID, "action": "trust.accept",
+		})
+		return
+	}
+	granted := false
+	skipReason := "acceptance_not_applied"
+	defer func() {
+		if granted {
+			attempt.complete(actionhook.StatusSucceeded, "", map[string]string{"grant_reason": "peer_acceptance"})
+			return
+		}
+		attempt.complete(actionhook.StatusSkipped, "", map[string]string{"skip_reason": skipReason})
+	}()
 
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
@@ -1061,6 +1133,7 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 	// Recently revoked? Drop the stale acceptance.
 	if until, ok := hm.revoked[peerNodeID]; ok {
 		if time.Now().Before(until) {
+			skipReason = "recently_revoked"
 			slog.Info("ignoring handshake acceptance from recently-revoked peer", "peer_node_id", peerNodeID)
 			delete(hm.outgoing, peerNodeID)
 			return
@@ -1071,6 +1144,7 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 	// Trust follows a request we actually made: an accept with no
 	// matching outgoing entry is unsolicited and is dropped.
 	if _, ok := hm.outgoing[peerNodeID]; !ok {
+		skipReason = "no_outgoing_request"
 		slog.Warn("dropping handshake acceptance with no matching outgoing request", "peer_node_id", peerNodeID)
 		return
 	}
@@ -1082,6 +1156,7 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 	if existing, ok := hm.trusted[peerNodeID]; ok {
 		bound := existing.PublicKey
 		if !hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
+			skipReason = "key_binding_changed"
 			delete(hm.outgoing, peerNodeID)
 			return
 		}
@@ -1098,6 +1173,7 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 		ApprovedAt: time.Now(),
 		Mutual:     true,
 	})
+	granted = true
 	hm.markDirty()
 
 	// Report trust to registry
@@ -1120,10 +1196,22 @@ func (hm *Manager) handleRejectMsg(msg *HandshakeMsg) {
 // First tries direct connection (port 444). If that fails (e.g. private node),
 // falls back to relaying through the registry.
 func (hm *Manager) SendRequest(peerNodeID uint32, justification string) error {
+	hm.mu.RLock()
+	if _, ok := hm.trusted[peerNodeID]; ok {
+		hm.mu.RUnlock()
+		return nil // already trusted
+	}
+	hm.mu.RUnlock()
+	attempt, err := hm.prepareTrustAction("trust.request", peerNodeID, "outbound", "operator_request", false, strings.TrimSpace(justification) != "")
+	if err != nil {
+		return err
+	}
+
 	hm.mu.Lock()
 	if _, ok := hm.trusted[peerNodeID]; ok {
 		hm.mu.Unlock()
-		return nil // already trusted
+		attempt.complete(actionhook.StatusSkipped, "", map[string]string{"skip_reason": "already_trusted"})
+		return nil
 	}
 	// An explicit handshake clears any post-revoke cooldown for this
 	// peer. The cooldown's purpose is to suppress stale registry-relayed
@@ -1150,8 +1238,9 @@ func (hm *Manager) SendRequest(peerNodeID uint32, justification string) error {
 	}
 
 	// Try direct connection first
-	err := hm.sendMessage(peerNodeID, &msg)
+	err = hm.sendMessage(peerNodeID, &msg)
 	if err == nil {
+		attempt.complete(actionhook.StatusSucceeded, "", map[string]string{"transport": "direct"})
 		return nil
 	}
 
@@ -1161,11 +1250,14 @@ func (hm *Manager) SendRequest(peerNodeID uint32, justification string) error {
 		sig := hm.signHandshakeChallenge(fmt.Sprintf("handshake:%d:%d", hm.rt.NodeID(), peerNodeID))
 		_, relayErr := reg.RequestHandshake(hm.rt.NodeID(), peerNodeID, justification, sig)
 		if relayErr != nil {
+			attempt.complete(actionhook.StatusFailed, "transport_unavailable", nil)
 			return fmt.Errorf("handshake relay: %w", relayErr)
 		}
 		slog.Info("handshake relayed via registry", "peer_node_id", peerNodeID)
+		attempt.complete(actionhook.StatusSucceeded, "", map[string]string{"transport": "registry_relay"})
 		return nil
 	}
+	attempt.complete(actionhook.StatusFailed, "transport_unavailable", nil)
 	return err
 }
 
@@ -1178,6 +1270,43 @@ func (hm *Manager) ProcessRelayedRequest(fromNodeID uint32, justification string
 // processRelayedRequest handles a handshake request received via registry relay.
 func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string) {
 	justification = sanitizeJustification(justification)
+
+	// Bound authority round-trips from relayed handshake spam: an unknown peer
+	// whose request can neither be queued (pending cap full) nor short-circuited
+	// (not already trusted) is rejected BEFORE the managed action hook makes its
+	// authority call. Already-trusted or already-pending peers are never dropped
+	// here — they fall through to the existing handling below, where the caps
+	// are authoritatively enforced.
+	hm.mu.Lock()
+	_, alreadyTrusted := hm.trusted[fromNodeID]
+	_, alreadyPending := hm.pending[fromNodeID]
+	overCap := !alreadyPending && len(hm.pending) >= maxPendingHandshakes
+	hm.mu.Unlock()
+	if !alreadyTrusted && overCap {
+		slog.Warn("relayed handshake rejected before control hook: pending queue full", "peer_node_id", fromNodeID)
+		return
+	}
+
+	autoAttempt, autoErr := hm.prepareTrustAction("trust.auto_accept", fromNodeID, "inbound_relay", "incoming_request", true, justification != "")
+	autoAllowed := autoErr == nil
+	if autoErr != nil {
+		slog.Info("automatic relayed trust acceptance blocked", "peer_node_id", fromNodeID, "error", autoErr)
+		hm.rt.PublishEvent("handshake.control_blocked", map[string]interface{}{
+			"peer_node_id": fromNodeID, "action": "trust.auto_accept",
+		})
+	}
+	autoExecuted := false
+	autoReason := "candidate_not_used"
+	defer func() {
+		if autoAttempt == nil {
+			return
+		}
+		if autoExecuted {
+			autoAttempt.complete(actionhook.StatusSucceeded, "", map[string]string{"grant_reason": autoReason})
+			return
+		}
+		autoAttempt.complete(actionhook.StatusSkipped, "", map[string]string{"skip_reason": autoReason})
+	}()
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
@@ -1194,13 +1323,14 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 	}
 
 	// Check if we have an outgoing request to this peer (mutual handshake)
-	if _, ok := hm.outgoing[fromNodeID]; ok {
+	if _, ok := hm.outgoing[fromNodeID]; ok && autoAllowed {
 		delete(hm.outgoing, fromNodeID)
 		hm.markTrustedLocked(fromNodeID, &TrustRecord{
 			NodeID:     fromNodeID,
 			ApprovedAt: time.Now(),
 			Mutual:     true,
 		})
+		autoExecuted, autoReason = true, "mutual"
 		slog.Info("mutual relayed handshake auto-approved", "peer_node_id", fromNodeID)
 		hm.markDirty()
 		// Respond via registry and backfill public key
@@ -1216,12 +1346,13 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 	}
 
 	// Check if peers are on the same network (network trust)
-	if hm.sameNetwork(fromNodeID) {
+	if hm.sameNetwork(fromNodeID) && autoAllowed {
 		hm.markTrustedLocked(fromNodeID, &TrustRecord{
 			NodeID:     fromNodeID,
 			ApprovedAt: time.Now(),
 			Network:    hm.sharedNetwork(fromNodeID),
 		})
+		autoExecuted, autoReason = true, "same_network"
 		slog.Info("same network relayed handshake auto-approved", "peer_node_id", fromNodeID)
 		hm.markDirty()
 		if reg := hm.rt.Registry(); reg != nil {
@@ -1242,11 +1373,12 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 	//
 	// The relay carries no peer public key, so the empty key is passed:
 	// allowlist entries that carry a pin do not match on this path.
-	if name, ok := hm.trustedAgentName(fromNodeID, ""); ok {
+	if name, ok := hm.trustedAgentName(fromNodeID, ""); ok && autoAllowed {
 		hm.markTrustedLocked(fromNodeID, &TrustRecord{
 			NodeID:     fromNodeID,
 			ApprovedAt: time.Now(),
 		})
+		autoExecuted, autoReason = true, "trusted_agent"
 		slog.Info("relayed handshake auto-approved (trusted agent)",
 			"peer_node_id", fromNodeID, "agent", name)
 		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
@@ -1269,12 +1401,13 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 	}
 
 	// Auto-approve all requests when the daemon is configured to do so.
-	if hm.rt.TrustAutoApprove() {
+	if hm.rt.TrustAutoApprove() && autoAllowed {
 		hm.markTrustedLocked(fromNodeID, &TrustRecord{
 			NodeID:     fromNodeID,
 			ApprovedAt: time.Now(),
 			Mutual:     false,
 		})
+		autoExecuted, autoReason = true, "auto_approve"
 		slog.Info("relayed handshake auto-approved (trust-auto-approve enabled)", "peer_node_id", fromNodeID)
 		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
 			"peer_node_id": fromNodeID, "reason": "auto_approve",
@@ -1326,11 +1459,29 @@ func (hm *Manager) ProcessRelayedApproval(fromNodeID uint32) {
 // This is called when the peer approved our outgoing request and the acceptance
 // was relayed back through the registry (because direct dial to port 444 failed).
 func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
+	attempt, actionErr := hm.prepareTrustAction("trust.accept", fromNodeID, "outbound_completion_relay", "peer_acceptance", true, false)
+	if actionErr != nil {
+		slog.Info("trust establishment from relayed acceptance blocked", "peer_node_id", fromNodeID, "error", actionErr)
+		hm.rt.PublishEvent("handshake.control_blocked", map[string]interface{}{
+			"peer_node_id": fromNodeID, "action": "trust.accept",
+		})
+		return
+	}
+	granted := false
+	skipReason := "approval_not_applied"
+	defer func() {
+		if granted {
+			attempt.complete(actionhook.StatusSucceeded, "", map[string]string{"grant_reason": "peer_acceptance_relayed"})
+			return
+		}
+		attempt.complete(actionhook.StatusSkipped, "", map[string]string{"skip_reason": skipReason})
+	}()
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
 	// Already trusted? Nothing to do.
 	if _, ok := hm.trusted[fromNodeID]; ok {
+		skipReason = "already_trusted"
 		slog.Debug("relayed approval from already-trusted node", "peer_node_id", fromNodeID)
 		return
 	}
@@ -1338,6 +1489,7 @@ func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
 	// Recently revoked? Drop the stale relay rather than re-establishing trust.
 	if until, ok := hm.revoked[fromNodeID]; ok {
 		if time.Now().Before(until) {
+			skipReason = "recently_revoked"
 			slog.Info("ignoring relayed approval for recently-revoked peer", "peer_node_id", fromNodeID)
 			delete(hm.outgoing, fromNodeID)
 			return
@@ -1346,6 +1498,7 @@ func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
 	}
 
 	if _, ok := hm.outgoing[fromNodeID]; !ok {
+		skipReason = "no_outgoing_request"
 		slog.Warn("dropping relayed approval with no matching outgoing request", "peer_node_id", fromNodeID)
 		return
 	}
@@ -1356,6 +1509,7 @@ func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
 		ApprovedAt: time.Now(),
 		Mutual:     true,
 	})
+	granted = true
 	hm.markDirty()
 	slog.Info("trust established via relayed approval", "peer_node_id", fromNodeID)
 
@@ -1433,10 +1587,22 @@ func (hm *Manager) processRelayedRejection(fromNodeID uint32) {
 
 // ApproveHandshake approves a pending handshake request.
 func (hm *Manager) ApproveHandshake(peerNodeID uint32) error {
+	hm.mu.RLock()
+	preview, exists := hm.pending[peerNodeID]
+	hm.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+	attempt, err := hm.prepareTrustAction("trust.accept", peerNodeID, "inbound", "operator_approval", false, strings.TrimSpace(preview.Justification) != "")
+	if err != nil {
+		return err
+	}
+
 	hm.mu.Lock()
 	req, ok := hm.pending[peerNodeID]
 	if !ok {
 		hm.mu.Unlock()
+		attempt.complete(actionhook.StatusSkipped, "", map[string]string{"skip_reason": "request_no_longer_pending"})
 		return nil
 	}
 	hm.markTrustedLocked(peerNodeID, &TrustRecord{
@@ -1446,6 +1612,7 @@ func (hm *Manager) ApproveHandshake(peerNodeID uint32) error {
 	})
 	hm.markDirty()
 	hm.mu.Unlock()
+	attempt.complete(actionhook.StatusSucceeded, "", map[string]string{"grant_reason": "operator_approval"})
 
 	slog.Info("handshake approved", "peer_node_id", peerNodeID)
 	hm.rt.PublishEvent("handshake.approved", map[string]interface{}{
