@@ -891,26 +891,12 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 		"peer_node_id": peerNodeID, "justification": justification,
 	})
 
-	// Fast pre-checks: an already-trusted peer (no new trust needed) and
-	// over-cap spam are handled here. The authoritative trust/cap decisions
-	// are still made under the lock below, so this is a guard, not the
-	// enforcement.
-	hm.mu.Lock()
-	if _, ok := hm.trusted[peerNodeID]; ok && hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
-		hm.sendAcceptLocked(peerNodeID)
-		hm.mu.Unlock()
-		slog.Debug("node already trusted (pre-hook fast path)", "peer_node_id", peerNodeID)
-		return
-	}
-	if _, exists := hm.pending[peerNodeID]; !exists {
-		if len(hm.pending) >= maxPendingHandshakes ||
-			(source != 0 && hm.pendingBySource[source] >= maxPendingPerSource) {
-			hm.mu.Unlock()
-			slog.Warn("handshake rejected before control hook: pending queue full", "peer_node_id", peerNodeID, "source", source)
-			return
-		}
-	}
-	hm.mu.Unlock()
+	// The pending-queue caps are enforced where a request is actually queued,
+	// at the end of this function. They used to be checked here as well, to
+	// keep over-cap spam away from a control hook that no longer exists —
+	// which also dropped a peer the rules below would have accepted without
+	// queueing it (mutual request, shared network, trusted agent,
+	// trust-auto-approve) whenever the queue happened to be full.
 
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
@@ -1207,20 +1193,9 @@ func (hm *Manager) ProcessRelayedRequest(fromNodeID uint32, justification string
 func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string) {
 	justification = sanitizeJustification(justification)
 
-	// Relayed handshake spam: an unknown peer whose request can neither be
-	// queued (pending cap full) nor short-circuited (not already trusted) is
-	// rejected here. Already-trusted or already-pending peers are never dropped
-	// here — they fall through to the existing handling below, where the caps
-	// are authoritatively enforced.
-	hm.mu.Lock()
-	_, alreadyTrusted := hm.trusted[fromNodeID]
-	_, alreadyPending := hm.pending[fromNodeID]
-	overCap := !alreadyPending && len(hm.pending) >= maxPendingHandshakes
-	hm.mu.Unlock()
-	if !alreadyTrusted && overCap {
-		slog.Warn("relayed handshake rejected before control hook: pending queue full", "peer_node_id", fromNodeID)
-		return
-	}
+	// As in handleRequest: the pending caps are enforced where the request is
+	// queued, below, so a full queue does not stop a peer the auto-accept
+	// rules would take without queueing it.
 
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
