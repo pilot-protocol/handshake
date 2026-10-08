@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -129,6 +130,7 @@ type Manager struct {
 	done            chan struct{}        // closed in Stop to signal drain goroutine exit
 	drainDone       chan struct{}        // closed when drainSaves returns
 	saveMu          sync.Mutex           // serializes saveTrust: concurrent saves would share trust.json.tmp
+	unsaved         atomic.Bool          // changed since the last successful save; set by markDirty
 
 	// Replay protection
 	replayMu   sync.Mutex
@@ -186,10 +188,16 @@ func NewManager(rt Runtime) *Manager {
 // between a pending dirty signal and done at random, and nothing drained
 // the signals RPCs sent while Stop waited for them.
 //
+// The final save happens only if something changed since the last
+// successful save. A start followed by a stop leaves trust.json as it
+// was, including one that failed to parse at startup, which the next
+// real trust change overwrites but Stop on its own must not.
+//
 // Stop is safe to call more than once, concurrently included. The daemon
 // calls it twice (Daemon.Stop and the plugin runtime's Service.Stop).
-// Every call saves, so a second call picks up what RPCs that outlived the
-// first call's wait have changed since, but it does not wait again.
+// Every call saves what is unsaved, so a second call picks up what RPCs
+// that outlived the first call's wait have changed since, but it does not
+// wait again.
 func (hm *Manager) Stop() {
 	// Mark stopping under mu so goRPC cannot race wg.Add vs wg.Wait.
 	// Any goRPC that holds mu.RLock() and sees stopping=false has already
@@ -219,7 +227,7 @@ func (hm *Manager) Stop() {
 
 	hm.doneOnce.Do(func() { close(hm.done) })
 	<-hm.drainDone
-	hm.saveTrust()
+	hm.saveTrustIfUnsaved()
 }
 
 // waitForRPCs waits until the background RPCs have finished or the stop
@@ -393,6 +401,7 @@ type revokedSnapshotEntry struct {
 	Until  string `json:"until"` // RFC3339 timestamp of cooldown expiry
 }
 
+// saveTrust writes the current trust state to storePath.
 func (hm *Manager) saveTrust() {
 	if hm.storePath == "" {
 		return
@@ -404,9 +413,34 @@ func (hm *Manager) saveTrust() {
 	// file into place. Taken before mu: no caller holds mu here.
 	hm.saveMu.Lock()
 	defer hm.saveMu.Unlock()
+	hm.saveTrustLocked()
+}
 
+// saveTrustIfUnsaved is saveTrust, skipped when nothing has changed since
+// the last successful save. The check is made under saveMu, so a caller
+// that skips has waited out any save already running, and sees its
+// outcome: a save that failed leaves unsaved set, and this one retries.
+func (hm *Manager) saveTrustIfUnsaved() {
+	if hm.storePath == "" {
+		return
+	}
+	hm.saveMu.Lock()
+	defer hm.saveMu.Unlock()
+	if hm.unsaved.Load() {
+		hm.saveTrustLocked()
+	}
+}
+
+// saveTrustLocked does the work of saveTrust. Caller MUST hold saveMu.
+func (hm *Manager) saveTrustLocked() {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
+
+	// Every change sets unsaved under mu.Lock, so clearing it here, under
+	// mu.RLock and before the snapshot, cannot drop one: a change made
+	// before this point is in the snapshot, and one made after sets it
+	// again. A failed write sets it again too.
+	hm.unsaved.Store(false)
 
 	snap := trustSnapshot{}
 	for _, r := range hm.trusted {
@@ -444,11 +478,13 @@ func (hm *Manager) saveTrust() {
 
 	dir := filepath.Dir(hm.storePath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
+		hm.unsaved.Store(true)
 		slog.Error("create trust state directory", "dir", dir, "err", err)
 		return
 	}
 
 	if err := fsutil.AtomicWrite(hm.storePath, data); err != nil {
+		hm.unsaved.Store(true)
 		slog.Error("write trust state", "err", err)
 		return
 	}
@@ -458,8 +494,8 @@ func (hm *Manager) saveTrust() {
 // drainSaves drains the dirty channel and persists trust state
 // asynchronously, so that AtomicWrite (including fsync) does not
 // block other handshake operations holding hm.mu. It returns once done
-// is closed, possibly with a dirty signal still pending; Stop's own save
-// covers that, after waiting on drainDone.
+// is closed, possibly with a dirty signal still pending; Stop waits on
+// drainDone and then saves whatever is still unsaved.
 func (hm *Manager) drainSaves() {
 	defer close(hm.drainDone)
 	for {
@@ -472,9 +508,11 @@ func (hm *Manager) drainSaves() {
 	}
 }
 
-// markDirty signals the drain goroutine that trust state needs
-// persistence. Caller MUST hold hm.mu (write-locked).
+// markDirty records that trust state has changed since the last
+// successful save and signals the drain goroutine to persist it. Caller
+// MUST hold hm.mu (write-locked).
 func (hm *Manager) markDirty() {
+	hm.unsaved.Store(true)
 	select {
 	case hm.dirty <- struct{}{}:
 	default:

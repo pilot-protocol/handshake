@@ -313,3 +313,121 @@ func TestStop_ConcurrentCalls(t *testing.T) {
 		t.Fatalf("trust.json.tmp left behind (stat err = %v)", err)
 	}
 }
+
+// Stop saves only what changed. A trust.json that failed to parse at
+// startup is left exactly as it was by a start and stop with no trust
+// change in between; before, Stop replaced it with the empty state.
+func TestStop_KeepsUnparseableTrustFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trust.json")
+	corrupt := []byte("{\"trusted\": [{\"node_id\": 7, \"public_key\": \"a2V5\"},]}\n")
+	if err := os.WriteFile(path, corrupt, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	hm := newPersistentHM(t, dir, nil)
+	hm.mu.RLock()
+	loaded := len(hm.trusted)
+	hm.mu.RUnlock()
+	if loaded != 0 {
+		t.Fatalf("loaded %d trusted entries from a file that should not parse", loaded)
+	}
+	hm.Stop()
+	hm.Stop() // the daemon stops the manager twice
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read trust.json: %v", err)
+	}
+	if string(got) != string(corrupt) {
+		t.Fatalf("Stop rewrote an unparseable trust.json:\n got %q\nwant %q", got, corrupt)
+	}
+}
+
+// With nothing changed, Stop does not write: an existing trust.json keeps
+// its contents and mtime, and a missing one is not created.
+func TestStop_NoChangeDoesNotWrite(t *testing.T) {
+	t.Parallel()
+
+	t.Run("existing file", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		path := filepath.Join(dir, "trust.json")
+		body := []byte(`{"trusted":[{"node_id":7,"public_key":"a2V5","approved_at":"2026-01-02T03:04:05Z","mutual":true}]}`)
+		if err := os.WriteFile(path, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+		// An mtime far in the past, so any rewrite shows whatever the
+		// filesystem's timestamp granularity.
+		old := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+
+		hm := newPersistentHM(t, dir, nil)
+		if !hm.IsTrusted(7) {
+			t.Fatal("trust.json did not load")
+		}
+		hm.Stop()
+		hm.Stop()
+
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat trust.json: %v", err)
+		}
+		if !fi.ModTime().Equal(old) {
+			t.Fatalf("trust.json mtime = %v, want %v: Stop wrote with nothing changed", fi.ModTime(), old)
+		}
+		if got, _ := os.ReadFile(path); string(got) != string(body) {
+			t.Fatalf("trust.json changed:\n got %q\nwant %q", got, body)
+		}
+	})
+
+	t.Run("no file", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		hm := newPersistentHM(t, dir, nil)
+		hm.Stop()
+		hm.Stop()
+		if _, err := os.Stat(filepath.Join(dir, "trust.json")); !os.IsNotExist(err) {
+			t.Fatalf("Stop created trust.json with nothing changed (stat err = %v)", err)
+		}
+	})
+}
+
+// A save that fails leaves the change marked unsaved, so Stop retries it
+// instead of taking the failed attempt as done.
+func TestStop_RetriesAfterFailedSave(t *testing.T) {
+	t.Parallel()
+	const peer = uint32(700)
+	dir := t.TempDir()
+	// A directory where AtomicWrite stages its file makes every save fail.
+	tmp := filepath.Join(dir, "trust.json.tmp")
+	if err := os.Mkdir(tmp, 0700); err != nil {
+		t.Fatal(err)
+	}
+	hm := newPersistentHM(t, dir, nil)
+
+	hm.mu.Lock()
+	hm.markTrustedLocked(peer, &TrustRecord{NodeID: peer, ApprovedAt: time.Now()})
+	hm.markDirty()
+	hm.mu.Unlock()
+	hm.saveTrust()
+
+	// Under saveMu, so no save by the drain goroutine is half done.
+	hm.saveMu.Lock()
+	unsaved := hm.unsaved.Load()
+	hm.saveMu.Unlock()
+	if !unsaved {
+		t.Fatal("a failed save cleared the unsaved flag")
+	}
+
+	if err := os.Remove(tmp); err != nil {
+		t.Fatal(err)
+	}
+	hm.Stop()
+	if _, ok := readTrustFile(t, dir)[peer]; !ok {
+		t.Fatalf("peer %d missing from trust.json: Stop did not retry the failed save", peer)
+	}
+}
