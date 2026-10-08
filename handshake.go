@@ -83,6 +83,12 @@ const (
 	maxPendingHandshakes  = 256                    // cap pending (unapproved) handshake requests
 	maxPendingPerSource   = 16
 	maxJustificationLen   = 1024
+	// stopRPCWait bounds how long Stop waits for in-flight background
+	// RPCs before it saves and returns. A registry RPC can sit in its
+	// 30 s read deadline, and the daemon's whole shutdown budget is
+	// shorter than that, so Stop cannot wait them out. The deadline is
+	// set by the first Stop; later calls do not extend it.
+	stopRPCWait = 2 * time.Second
 	// pendingHandshakeTTL caps how long a pending (unapproved-by-
 	// operator) handshake request can sit in hm.pending before the
 	// reaper drops it. Without this, a request from a peer that the
@@ -115,9 +121,14 @@ type Manager struct {
 	stopping        bool                 // set under mu.Lock() before wg.Wait() in Stop
 	wg              sync.WaitGroup       // tracks background RPCs for clean shutdown
 	reapStop        chan struct{}        // signals replay reaper to stop
-	stopOnce        sync.Once            // ensures reapStop is closed only once
+	stopOnce        sync.Once            // first Stop: sets stopDeadline, starts rpcsDone, closes reapStop
+	stopDeadline    time.Time            // first Stop + stopRPCWait; no Stop waits for RPCs past it
+	rpcsDone        chan struct{}        // closed once wg drains after the first Stop
+	doneOnce        sync.Once            // ensures done is closed only once
 	dirty           chan struct{}        // buffered 1: non-blocking signal to drain goroutine
 	done            chan struct{}        // closed in Stop to signal drain goroutine exit
+	drainDone       chan struct{}        // closed when drainSaves returns
+	saveMu          sync.Mutex           // serializes saveTrust: concurrent saves would share trust.json.tmp
 
 	// Replay protection
 	replayMu   sync.Mutex
@@ -147,6 +158,7 @@ func NewManager(rt Runtime) *Manager {
 		trustWaiters:    make(map[uint32][]chan struct{}),
 		dirty:           make(chan struct{}, 1),
 		done:            make(chan struct{}),
+		drainDone:       make(chan struct{}),
 	}
 
 	if path := rt.IdentityPath(); path != "" {
@@ -160,7 +172,24 @@ func NewManager(rt Runtime) *Manager {
 	return hm
 }
 
-// Stop waits for all background RPCs to finish and stops the replay reaper.
+// Stop stops the replay reaper and the save goroutine, and saves trust
+// state one last time, so that every trust change made before it returns
+// is on disk.
+//
+// It first waits for in-flight background RPCs, because some of them
+// change trust (backfillPeerKey binds or drops a record), but only until
+// stopRPCWait after the first Stop: an RPC that is still running then
+// keeps running, and its change is saved by a later Stop, if any. Only
+// after that wait does it stop the drain goroutine, and it waits for that
+// goroutine to finish any save it has started before saving itself.
+// Closing done first, as Stop used to, lost changes: drainSaves picks
+// between a pending dirty signal and done at random, and nothing drained
+// the signals RPCs sent while Stop waited for them.
+//
+// Stop is safe to call more than once, concurrently included. The daemon
+// calls it twice (Daemon.Stop and the plugin runtime's Service.Stop).
+// Every call saves, so a second call picks up what RPCs that outlived the
+// first call's wait have changed since, but it does not wait again.
 func (hm *Manager) Stop() {
 	// Mark stopping under mu so goRPC cannot race wg.Add vs wg.Wait.
 	// Any goRPC that holds mu.RLock() and sees stopping=false has already
@@ -169,16 +198,47 @@ func (hm *Manager) Stop() {
 	hm.stopping = true
 	hm.mu.Unlock()
 
-	// Both done and reapStop share stopOnce so a double-Stop (common in
-	// test cleanup paths that defer hm.Stop() while a parent also calls it)
-	// doesn't panic with "close of closed channel".
+	// The once makes a double-Stop (common in test cleanup paths that
+	// defer hm.Stop() while a parent also calls it) safe: reapStop is
+	// closed once, and every call shares one deadline and one waiter.
 	hm.stopOnce.Do(func() {
-		close(hm.done)
+		hm.stopDeadline = time.Now().Add(stopRPCWait)
+		hm.rpcsDone = make(chan struct{})
+		go func() {
+			hm.wg.Wait()
+			close(hm.rpcsDone)
+		}()
 		if hm.reapStop != nil {
 			close(hm.reapStop)
 		}
 	})
-	hm.wg.Wait()
+	if !hm.waitForRPCs() {
+		slog.Warn("handshake: stopping with background RPCs still running; only a later Stop saves what they change",
+			"waited", stopRPCWait)
+	}
+
+	hm.doneOnce.Do(func() { close(hm.done) })
+	<-hm.drainDone
+	hm.saveTrust()
+}
+
+// waitForRPCs waits until the background RPCs have finished or the stop
+// deadline has passed, and reports whether they finished. Called by Stop
+// after stopOnce has set stopDeadline and rpcsDone.
+func (hm *Manager) waitForRPCs() bool {
+	select {
+	case <-hm.rpcsDone:
+		return true
+	default:
+	}
+	timer := time.NewTimer(time.Until(hm.stopDeadline))
+	defer timer.Stop()
+	select {
+	case <-hm.rpcsDone:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // goRPC launches a tracked background goroutine.
@@ -338,6 +398,13 @@ func (hm *Manager) saveTrust() {
 		return
 	}
 
+	// Saves run from drainSaves and from Stop, and Stop may run more than
+	// once at a time. AtomicWrite stages every write in the same
+	// trust.json.tmp, so two at once could rename each other's half-written
+	// file into place. Taken before mu: no caller holds mu here.
+	hm.saveMu.Lock()
+	defer hm.saveMu.Unlock()
+
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
 
@@ -390,8 +457,11 @@ func (hm *Manager) saveTrust() {
 
 // drainSaves drains the dirty channel and persists trust state
 // asynchronously, so that AtomicWrite (including fsync) does not
-// block other handshake operations holding hm.mu.
+// block other handshake operations holding hm.mu. It returns once done
+// is closed, possibly with a dirty signal still pending; Stop's own save
+// covers that, after waiting on drainDone.
 func (hm *Manager) drainSaves() {
+	defer close(hm.drainDone)
 	for {
 		select {
 		case <-hm.dirty:
