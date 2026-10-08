@@ -175,8 +175,9 @@ func NewManager(rt Runtime) *Manager {
 }
 
 // Stop stops the replay reaper and the save goroutine, and saves trust
-// state one last time, so that every trust change made before it returns
-// is on disk.
+// state one last time: every trust change made before it returns is
+// written, except one made by an RPC still running after the wait below,
+// or one whose write fails (logged).
 //
 // It first waits for in-flight background RPCs, because some of them
 // change trust (backfillPeerKey binds or drops a record), but only until
@@ -436,10 +437,11 @@ func (hm *Manager) saveTrustLocked() {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
 
-	// Every change sets unsaved under mu.Lock, so clearing it here, under
-	// mu.RLock and before the snapshot, cannot drop one: a change made
-	// before this point is in the snapshot, and one made after sets it
-	// again. A failed write sets it again too.
+	// Every change to persisted state (trusted, pending, revoked) sets
+	// unsaved under mu.Lock, so clearing it here, under mu.RLock and
+	// before the snapshot, cannot drop one: a change made before this
+	// point is in the snapshot, and one made after sets it again. A failed
+	// write sets it again too.
 	hm.unsaved.Store(false)
 
 	snap := trustSnapshot{}
