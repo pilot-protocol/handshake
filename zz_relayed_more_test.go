@@ -173,10 +173,12 @@ func TestReapOutgoingAndRevoked_PrunesExpired(t *testing.T) {
 	t.Parallel()
 	hm := newTestHM(t, "")
 	hm.mu.Lock()
-	// Old outgoing — should be reaped.
-	hm.outgoing[10] = time.Now().Add(-2 * time.Hour)
+	// Past outgoingRequestTTL — should be reaped.
+	hm.outgoing[10] = time.Now().Add(-outgoingRequestTTL - time.Hour)
 	// Fresh outgoing — should remain.
 	hm.outgoing[20] = time.Now()
+	// Hours old: a person may still accept it — should remain.
+	hm.outgoing[30] = time.Now().Add(-2 * time.Hour)
 	hm.mu.Unlock()
 
 	hm.reapOutgoingAndRevoked()
@@ -188,5 +190,8 @@ func TestReapOutgoingAndRevoked_PrunesExpired(t *testing.T) {
 	}
 	if _, ok := hm.outgoing[20]; !ok {
 		t.Error("fresh outgoing should remain")
+	}
+	if _, ok := hm.outgoing[30]; !ok {
+		t.Error("a request sent two hours ago should still be answerable")
 	}
 }

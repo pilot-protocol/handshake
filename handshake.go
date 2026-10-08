@@ -98,6 +98,17 @@ const (
 	// operators ample time to decide without letting the queue grow
 	// unboundedly under sustained inbound handshake pressure.
 	pendingHandshakeTTL = 30 * 24 * time.Hour
+	// outgoingRequestTTL is how long a request this node sent stays
+	// answerable: the peer keeps it pending for pendingHandshakeTTL, and an
+	// acceptance is honoured only while the matching outgoing entry exists.
+	// It used to be 2 x handshakeMaxAge (10 minutes), so a person who
+	// accepted later than that, as people do, was trusted on their side and
+	// silently dropped as "unsolicited" on the requester's, which then showed
+	// the request as waiting forever.
+	outgoingRequestTTL = pendingHandshakeTTL
+	// maxOutgoingRequests bounds the outgoing set; past it the oldest
+	// request is forgotten first.
+	maxOutgoingRequests = 4096
 )
 
 // replayEntry is one recorded handshake message hash: when it was first
@@ -301,7 +312,7 @@ func (hm *Manager) goRPCLocked(fn func()) {
 func (hm *Manager) markTrustedLocked(nodeID uint32, rec *TrustRecord) {
 	hm.trusted[nodeID] = rec
 	hm.deletePendingLocked(nodeID)
-	delete(hm.outgoing, nodeID)
+	hm.dropOutgoingLocked(nodeID)
 	hm.trustWaitersMu.Lock()
 	waiters := hm.trustWaiters[nodeID]
 	delete(hm.trustWaiters, nodeID)
@@ -379,6 +390,14 @@ type trustSnapshot struct {
 	Trusted []trustSnapshotEntry   `json:"trusted"`
 	Pending []pendingSnapshotEntry `json:"pending,omitempty"`
 	Revoked []revokedSnapshotEntry `json:"revoked,omitempty"`
+	// Outgoing are the requests this node sent and is still waiting on, so
+	// an acceptance that arrives after a restart is still honoured.
+	Outgoing []outgoingSnapshotEntry `json:"outgoing,omitempty"`
+}
+
+type outgoingSnapshotEntry struct {
+	NodeID uint32 `json:"node_id"`
+	SentAt string `json:"sent_at"`
 }
 
 type trustSnapshotEntry struct {
@@ -462,6 +481,11 @@ func (hm *Manager) saveTrustLocked() {
 			ReceivedAt:    p.ReceivedAt.Format(time.RFC3339),
 			Source:        p.Source,
 		})
+	}
+	for nodeID, sentAt := range hm.outgoing {
+		if time.Since(sentAt) < outgoingRequestTTL {
+			snap.Outgoing = append(snap.Outgoing, outgoingSnapshotEntry{NodeID: nodeID, SentAt: sentAt.Format(time.RFC3339)})
+		}
 	}
 	for nodeID, until := range hm.revoked {
 		// Only persist entries whose cooldown hasn't expired yet.
@@ -585,7 +609,18 @@ func (hm *Manager) loadTrust() {
 			hm.revoked[e.NodeID] = until
 		}
 	}
-	slog.Info("loaded trust state", "peers", len(hm.trusted), "pending", len(hm.pending), "revoked", len(hm.revoked))
+	for _, e := range snap.Outgoing {
+		sent, err := time.Parse(time.RFC3339, e.SentAt)
+		if err != nil {
+			slog.Warn("outgoing entry has malformed SentAt — skipping",
+				"node_id", e.NodeID, "sent_at", e.SentAt, "err", err)
+			continue
+		}
+		if _, trusted := hm.trusted[e.NodeID]; !trusted && time.Since(sent) < outgoingRequestTTL {
+			hm.outgoing[e.NodeID] = sent
+		}
+	}
+	slog.Info("loaded trust state", "peers", len(hm.trusted), "pending", len(hm.pending), "revoked", len(hm.revoked), "outgoing", len(hm.outgoing))
 }
 
 // Start binds port 444 and begins handling handshake connections.
@@ -917,8 +952,8 @@ func (hm *Manager) reapReplayLocked(now time.Time) {
 //
 // outgoing: peers we sent a handshake request to but never heard back from.
 // A peer that never responds (wrong address, dropped, ignore-listed) would
-// otherwise hold a map entry forever. We evict after 2× handshakeMaxAge —
-// long enough for any in-flight response to arrive.
+// otherwise hold a map entry forever. We evict after outgoingRequestTTL,
+// as long as the peer keeps the request pending for a person to answer.
 //
 // revoked: peers in post-revocation cooldown. The lazy-delete in handleRequest
 // / handleRelayRequest only fires on the next *contact from that peer*, which
@@ -927,10 +962,9 @@ func (hm *Manager) reapOutgoingAndRevoked() {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 	now := time.Now()
-	outgoingTTL := 2 * handshakeMaxAge
 	for nodeID, sentAt := range hm.outgoing {
-		if now.Sub(sentAt) > outgoingTTL {
-			delete(hm.outgoing, nodeID)
+		if now.Sub(sentAt) > outgoingRequestTTL {
+			hm.dropOutgoingLocked(nodeID)
 		}
 	}
 	for nodeID, until := range hm.revoked {
@@ -938,6 +972,33 @@ func (hm *Manager) reapOutgoingAndRevoked() {
 			delete(hm.revoked, nodeID)
 		}
 	}
+}
+
+// dropOutgoingLocked forgets a request this node sent, and marks the state
+// for saving, since outgoing requests are persisted. Caller MUST hold
+// hm.mu (write-locked).
+func (hm *Manager) dropOutgoingLocked(nodeID uint32) {
+	if _, ok := hm.outgoing[nodeID]; ok {
+		delete(hm.outgoing, nodeID)
+		hm.markDirty()
+	}
+}
+
+// addOutgoingLocked records a request this node sent, forgetting the oldest
+// when the set is full. Caller MUST hold hm.mu (write-locked).
+func (hm *Manager) addOutgoingLocked(nodeID uint32, at time.Time) {
+	if _, ok := hm.outgoing[nodeID]; !ok && len(hm.outgoing) >= maxOutgoingRequests {
+		var oldest uint32
+		var oldestAt time.Time
+		for id, t := range hm.outgoing {
+			if oldestAt.IsZero() || t.Before(oldestAt) {
+				oldest, oldestAt = id, t
+			}
+		}
+		delete(hm.outgoing, oldest)
+	}
+	hm.outgoing[nodeID] = at
+	hm.markDirty()
 }
 
 func (hm *Manager) deletePendingLocked(nodeID uint32) {
@@ -1027,7 +1088,7 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	// cannot claim any NodeID with their own keypair and slip into trust.
 	if _, ok := hm.outgoing[peerNodeID]; ok && registryBound {
 		// Mutual! Auto-approve (registry confirmed pubkey binding)
-		delete(hm.outgoing, peerNodeID)
+		hm.dropOutgoingLocked(peerNodeID)
 		hm.markTrustedLocked(peerNodeID, &TrustRecord{
 			NodeID:     peerNodeID,
 			PublicKey:  msg.PublicKey,
@@ -1179,7 +1240,7 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 	if until, ok := hm.revoked[peerNodeID]; ok {
 		if time.Now().Before(until) {
 			slog.Info("ignoring handshake acceptance from recently-revoked peer", "peer_node_id", peerNodeID)
-			delete(hm.outgoing, peerNodeID)
+			hm.dropOutgoingLocked(peerNodeID)
 			return
 		}
 		delete(hm.revoked, peerNodeID)
@@ -1199,7 +1260,7 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 	if existing, ok := hm.trusted[peerNodeID]; ok {
 		bound := existing.PublicKey
 		if !hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
-			delete(hm.outgoing, peerNodeID)
+			hm.dropOutgoingLocked(peerNodeID)
 			return
 		}
 		// Preserve an already-bound key when the accept omits one.
@@ -1208,7 +1269,7 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 		}
 	}
 
-	delete(hm.outgoing, peerNodeID)
+	hm.dropOutgoingLocked(peerNodeID)
 	hm.markTrustedLocked(peerNodeID, &TrustRecord{
 		NodeID:     peerNodeID,
 		PublicKey:  msg.PublicKey,
@@ -1229,7 +1290,7 @@ func (hm *Manager) handleRejectMsg(msg *HandshakeMsg) {
 	slog.Warn("handshake rejected by peer", "peer_node_id", msg.NodeID, "reason", msg.Reason)
 
 	hm.mu.Lock()
-	delete(hm.outgoing, msg.NodeID)
+	hm.dropOutgoingLocked(msg.NodeID)
 	hm.mu.Unlock()
 }
 
@@ -1257,7 +1318,7 @@ func (hm *Manager) SendRequest(peerNodeID uint32, justification string) error {
 	// themselves locked out of a peer that was auto-pruned by policy
 	// (trust-decay, etc.) with no clean recovery path.
 	delete(hm.revoked, peerNodeID)
-	hm.outgoing[peerNodeID] = time.Now()
+	hm.addOutgoingLocked(peerNodeID, time.Now())
 	hm.mu.Unlock()
 
 	pubKeyStr := ""
@@ -1324,7 +1385,7 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 
 	// Check if we have an outgoing request to this peer (mutual handshake)
 	if _, ok := hm.outgoing[fromNodeID]; ok {
-		delete(hm.outgoing, fromNodeID)
+		hm.dropOutgoingLocked(fromNodeID)
 		hm.markTrustedLocked(fromNodeID, &TrustRecord{
 			NodeID:     fromNodeID,
 			ApprovedAt: time.Now(),
@@ -1468,7 +1529,7 @@ func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
 	if until, ok := hm.revoked[fromNodeID]; ok {
 		if time.Now().Before(until) {
 			slog.Info("ignoring relayed approval for recently-revoked peer", "peer_node_id", fromNodeID)
-			delete(hm.outgoing, fromNodeID)
+			hm.dropOutgoingLocked(fromNodeID)
 			return
 		}
 		delete(hm.revoked, fromNodeID)
@@ -1479,7 +1540,7 @@ func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
 		return
 	}
 
-	delete(hm.outgoing, fromNodeID)
+	hm.dropOutgoingLocked(fromNodeID)
 	hm.markTrustedLocked(fromNodeID, &TrustRecord{
 		NodeID:     fromNodeID,
 		ApprovedAt: time.Now(),
@@ -1555,7 +1616,7 @@ func (hm *Manager) ProcessRelayedRejection(fromNodeID uint32) {
 // processRelayedRejection handles a handshake rejection received via registry relay.
 func (hm *Manager) processRelayedRejection(fromNodeID uint32) {
 	hm.mu.Lock()
-	delete(hm.outgoing, fromNodeID)
+	hm.dropOutgoingLocked(fromNodeID)
 	hm.mu.Unlock()
 	slog.Info("handshake rejected via relay", "peer_node_id", fromNodeID)
 }
@@ -1654,7 +1715,7 @@ func (hm *Manager) RevokeTrust(peerNodeID uint32) error {
 	_, wasPending := hm.pending[peerNodeID]
 	delete(hm.trusted, peerNodeID)
 	hm.deletePendingLocked(peerNodeID)
-	delete(hm.outgoing, peerNodeID)
+	hm.dropOutgoingLocked(peerNodeID)
 	// Block stale relayed approvals still sitting in the registry inbox from
 	// re-establishing trust right after a local revoke. 5-minute cooldown covers
 	// the normal poll cycle many times over.
@@ -1719,7 +1780,7 @@ func (hm *Manager) handleRevokeMsg(msg *HandshakeMsg) {
 	_, wasPending := hm.pending[peerNodeID]
 	delete(hm.trusted, peerNodeID)
 	hm.deletePendingLocked(peerNodeID)
-	delete(hm.outgoing, peerNodeID)
+	hm.dropOutgoingLocked(peerNodeID)
 	if wasTrusted || wasPending {
 		hm.markDirty()
 	}
