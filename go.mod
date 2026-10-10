@@ -4,7 +4,7 @@ go 1.25.13
 
 require (
 	github.com/pilot-protocol/common v0.6.1
-	github.com/pilot-protocol/pilotprotocol v1.14.0
+	github.com/pilot-protocol/pilotprotocol v1.16.0
 )
 
 require (
