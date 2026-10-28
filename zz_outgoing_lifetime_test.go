@@ -92,6 +92,7 @@ func TestOutgoing_CancelledRequestIsForgottenAcrossRestart(t *testing.T) {
 	before.saveTrust()
 	before.RevokeTrust(95)
 	before.saveTrust()
+	before.Stop() // the restart: its background save is done before the next one reads the file
 
 	after := newTestHM(t, path)
 	t.Cleanup(after.Stop)
