@@ -1652,20 +1652,56 @@ func (hm *Manager) ApproveHandshake(peerNodeID uint32) error {
 		"peer_node_id": peerNodeID, "state": "granted", "reason": "approved",
 	})
 
-	// Report trust to registry (creates the trust pair for resolve authorization)
-	if reg := hm.rt.Registry(); reg != nil {
-		nodeID := hm.rt.NodeID()
-		sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerNodeID))
-		hm.goRPC(func() {
-			reg.ReportTrust(nodeID, peerNodeID)
-			// Also respond via registry relay in case the request was relayed
-			reg.RespondHandshake(nodeID, peerNodeID, true, sig)
-		})
+	// Tell the requester, in the order that lets the answer arrive. The
+	// registry learns the trust pair first: until it has, a private requester
+	// cannot be looked up, so the direct accept fails. Then the answer goes
+	// through the relay (for a relayed request) and directly. Each step is
+	// retried and logged: when every copy of the answer was lost, this side
+	// trusted the requester while the requester still waited (and kept its
+	// messages queued) indefinitely.
+	reg := hm.rt.Registry()
+	if reg == nil {
+		hm.sendAccept(peerNodeID)
+		return nil
 	}
-
-	// Try to send accept directly (may fail if peer is private, that's OK)
-	hm.sendAccept(peerNodeID)
+	nodeID := hm.rt.NodeID()
+	sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerNodeID))
+	relayedRequest := req.PublicKey == ""
+	hm.goRPC(func() {
+		if err := hm.retryRPC(func() error { _, err := reg.ReportTrust(nodeID, peerNodeID); return err }); err != nil {
+			slog.Warn("handshake approved, but the registry did not take the trust pair", "peer_node_id", peerNodeID, "error", err)
+		}
+		if relayedRequest {
+			hm.backfillPeerKey(peerNodeID) // a relayed request carries no key: take the registry's
+		}
+		relayErr := hm.retryRPC(func() error { _, err := reg.RespondHandshake(nodeID, peerNodeID, true, sig); return err })
+		if err := hm.sendAccept(peerNodeID); err != nil && relayErr != nil {
+			slog.Warn("handshake approved, but the answer reached neither the relay nor the peer",
+				"peer_node_id", peerNodeID, "relay_error", relayErr, "direct_error", err)
+		}
+	})
 	return nil
+}
+
+// retryRPC runs a registry call up to three times, a second apart and then
+// two, unless the manager is stopping. A "no pending" answer is final.
+func (hm *Manager) retryRPC(call func() error) error {
+	var err error
+	for attempt, wait := range []time.Duration{0, time.Second, 2 * time.Second} {
+		if attempt > 0 {
+			hm.mu.RLock()
+			stopping := hm.stopping
+			hm.mu.RUnlock()
+			if stopping {
+				return err
+			}
+			time.Sleep(wait)
+		}
+		if err = call(); err == nil || strings.Contains(err.Error(), "no pending") {
+			return err
+		}
+	}
+	return err
 }
 
 // RejectHandshake rejects a pending handshake request.
