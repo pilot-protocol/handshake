@@ -94,9 +94,11 @@ type Runtime interface {
 // for it and falls back to IsTrusted when the adapter does not provide
 // it, so existing Runtime implementations keep compiling unchanged.
 //
-// pubKeyB64 is the base64 Ed25519 key the peer proved possession of on
-// this handshake, or "" when no authenticated key is in scope (the
-// registry-relayed path). Implementations that carry a pinned key for
+// pubKeyB64 is the base64 Ed25519 key the registry confirmed for the
+// peer: the key it signed a direct request with, or, for a request that
+// came over the registry relay, the key a registry lookup returned. It
+// is never empty: without a confirmed key no auto-accept rule runs.
+// Implementations that carry a pinned key for
 // the node MUST require an exact match and MUST treat "" as a miss;
 // entries with no pin answer the node-ID-only question, matching
 // IsTrusted.

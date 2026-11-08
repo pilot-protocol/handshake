@@ -51,10 +51,16 @@ type HandshakeMsg struct {
 // node ID is unchanged. Checks that have the peer's current key in
 // scope go through IsTrustedWithKey, which compares the two.
 //
+// A record is only ever bound to a key the registry confirmed for the
+// node: the key of a request or accept whose registry lookup matched it,
+// or the key a registry lookup returned. A key a peer merely presents
+// never binds a record, and never drops one either.
+//
 // An empty PublicKey means "unbound": records restored from a snapshot
-// written before keys were recorded, and relay-established records
-// whose backfillPeerKey has not landed yet, both look like this. Those
-// stay trusted on node ID alone and adopt the first key that turns up.
+// written before keys were recorded, records made over the registry
+// relay or from a request the registry could not confirm, before their
+// registry lookup has landed. Those stay trusted on node ID alone until
+// backfillPeerKey binds them to the registry's key.
 type TrustRecord struct {
 	NodeID     uint32
 	PublicKey  string // base64 Ed25519 pubkey
@@ -64,9 +70,16 @@ type TrustRecord struct {
 }
 
 // PendingHandshake is an unapproved incoming request.
+//
+// PublicKey is the key the request was signed with ("" for a request
+// that came over the registry relay). KeyConfirmed records whether the
+// registry listed that same key for NodeID when the request arrived;
+// approving the request binds the trust record to PublicKey only then,
+// and otherwise to the key a registry lookup returns.
 type PendingHandshake struct {
 	NodeID        uint32
 	PublicKey     string
+	KeyConfirmed  bool
 	Justification string
 	ReceivedAt    time.Time
 	Source        uint32
@@ -98,6 +111,10 @@ const (
 	// operators ample time to decide without letting the queue grow
 	// unboundedly under sustained inbound handshake pressure.
 	pendingHandshakeTTL = 30 * 24 * time.Hour
+	// bindRetryInterval spaces the registry lookups that bind an unbound
+	// trust record to its node's key (scheduleBind). Trust checks run per
+	// packet, so without it every packet from such a peer would start one.
+	bindRetryInterval = 30 * time.Second
 	// outgoingRequestTTL is how long a request this node sent stays
 	// answerable: the peer keeps it pending for pendingHandshakeTTL, and an
 	// acceptance is honoured only while the matching outgoing entry exists.
@@ -153,6 +170,12 @@ type Manager struct {
 	// so that markTrustedLocked can fire notifications while holding hm.mu.
 	trustWaitersMu sync.Mutex
 	trustWaiters   map[uint32][]chan struct{}
+
+	// Registry binds of unbound trust records (see scheduleBind): when one
+	// was last started for each node. bindMu is a leaf lock, taken after
+	// hm.mu when both are held.
+	bindMu    sync.Mutex
+	bindTried map[uint32]time.Time
 }
 
 // NewManager constructs a Manager bound to the given Runtime. Loads
@@ -169,6 +192,7 @@ func NewManager(rt Runtime) *Manager {
 		replaySet:       make(map[[32]byte]replayEntry),
 		replayPeer:      make(map[uint32]int),
 		trustWaiters:    make(map[uint32][]chan struct{}),
+		bindTried:       make(map[uint32]time.Time),
 		dirty:           make(chan struct{}, 1),
 		done:            make(chan struct{}),
 		drainDone:       make(chan struct{}),
@@ -411,6 +435,7 @@ type trustSnapshotEntry struct {
 type pendingSnapshotEntry struct {
 	NodeID        uint32 `json:"node_id"`
 	PublicKey     string `json:"public_key,omitempty"`
+	KeyConfirmed  bool   `json:"key_confirmed,omitempty"`
 	Justification string `json:"justification,omitempty"`
 	ReceivedAt    string `json:"received_at"`
 	Source        uint32 `json:"source,omitempty"`
@@ -477,6 +502,7 @@ func (hm *Manager) saveTrustLocked() {
 		snap.Pending = append(snap.Pending, pendingSnapshotEntry{
 			NodeID:        p.NodeID,
 			PublicKey:     p.PublicKey,
+			KeyConfirmed:  p.KeyConfirmed,
 			Justification: p.Justification,
 			ReceivedAt:    p.ReceivedAt.Format(time.RFC3339),
 			Source:        p.Source,
@@ -586,6 +612,7 @@ func (hm *Manager) loadTrust() {
 		hm.pending[e.NodeID] = &PendingHandshake{
 			NodeID:        e.NodeID,
 			PublicKey:     e.PublicKey,
+			KeyConfirmed:  e.KeyConfirmed,
 			Justification: e.Justification,
 			ReceivedAt:    received,
 			Source:        e.Source,
@@ -652,6 +679,7 @@ func (hm *Manager) Start() error {
 				hm.reapReplay()
 				hm.reapOutgoingAndRevoked()
 				hm.reapStalePending()
+				hm.reapBindAttempts()
 			case <-hm.reapStop:
 				return
 			}
@@ -740,8 +768,9 @@ func (hm *Manager) handleConnection(stream coreapi.Stream) {
 // processMessage handles an incoming handshake message.
 //
 // On a successful (claimed pubkey == registry-registered pubkey) match
-// we set registryBound = true and pass it to handleRequest. The
-// trusted-agents auto-accept path requires that flag — without it,
+// we set registryBound = true and pass it to handleRequest and
+// handleAccept. Every automatic trust rule, and every binding or
+// rebinding of a trust record, requires that flag — without it,
 // trusting a peer by node_id alone is unsafe (registry down or no
 // record means we'd be relying on signature verification against a
 // claimed pubkey that nothing has tied to the claimed node ID).
@@ -841,7 +870,7 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 	case HandshakeRequest:
 		hm.handleRequest(stream, msg, registryBound)
 	case HandshakeAccept:
-		hm.handleAccept(msg)
+		hm.handleAccept(msg, registryBound)
 	case HandshakeReject:
 		hm.handleRejectMsg(msg)
 	case HandshakeRevoke:
@@ -1047,9 +1076,10 @@ func sanitizeJustification(s string) string {
 //
 // registryBound is true iff processMessage confirmed the claimed
 // (node_id, public_key) binding via a registry lookup that returned a
-// non-empty pubkey matching the claimed one. It gates the trusted-
-// agents auto-accept path; signature-only authentication is not
-// enough to safely key on node_id.
+// non-empty pubkey matching the claimed one. It gates every auto-accept
+// rule (mutual, same network, trusted agent, trust-auto-approve) and
+// any change to an existing record's binding; signature-only
+// authentication is not enough to safely key on node_id.
 func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, registryBound bool) {
 	peerNodeID := msg.NodeID
 	var source uint32
@@ -1072,11 +1102,27 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	// Already trusted? Only if the record still binds the key this
-	// request carries — otherwise it is dropped here and the request
-	// falls through to the normal approval paths below.
-	if _, ok := hm.trusted[peerNodeID]; ok {
-		if hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
+	// Already trusted? A key the registry confirmed settles the binding:
+	// an unbound record takes it, and a record bound to another key is
+	// dropped here, so the request falls through to the approval paths
+	// below. A key the registry did not confirm changes nothing: it is
+	// answered only if the record is unbound or bound to that same key.
+	if rec, ok := hm.trusted[peerNodeID]; ok {
+		if registryBound {
+			if hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
+				slog.Debug("node already trusted", "peer_node_id", peerNodeID)
+				hm.sendAcceptLocked(peerNodeID)
+				return
+			}
+		} else {
+			switch {
+			case rec.PublicKey == "":
+				hm.scheduleBindLocked(peerNodeID)
+			case subtle.ConstantTimeCompare([]byte(rec.PublicKey), []byte(msg.PublicKey)) != 1:
+				slog.Warn("handshake request from a trusted node ID under another key the registry could not confirm, ignoring",
+					"peer_node_id", peerNodeID)
+				return
+			}
 			slog.Debug("node already trusted", "peer_node_id", peerNodeID)
 			hm.sendAcceptLocked(peerNodeID)
 			return
@@ -1115,7 +1161,7 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	// Check if peers are on the same network (network trust)
 	// SEC-038: same-network auto-trust is gated on registryBound so a
 	// peer cannot claim any NodeID with their own keypair and slip into trust.
-	if hm.sameNetwork(peerNodeID) && registryBound {
+	if registryBound && hm.sameNetwork(peerNodeID) {
 		hm.markTrustedLocked(peerNodeID, &TrustRecord{
 			NodeID:     peerNodeID,
 			PublicKey:  msg.PublicKey,
@@ -1174,8 +1220,13 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 		}
 	}
 
-	// Auto-approve all requests when the daemon is configured to do so.
-	if hm.rt.TrustAutoApprove() {
+	// Auto-approve all requests when the daemon is configured to do so,
+	// as long as the registry confirmed the requester's key, like every
+	// rule above. Without that, any sender could claim any node ID with
+	// its own key pair and be trusted under it. An unconfirmed request
+	// waits in the pending queue instead, for the operator or for a later
+	// request the registry does confirm.
+	if registryBound && hm.rt.TrustAutoApprove() {
 		hm.markTrustedLocked(peerNodeID, &TrustRecord{
 			NodeID:     peerNodeID,
 			PublicKey:  msg.PublicKey,
@@ -1198,7 +1249,16 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 		return
 	}
 
-	// Store as pending (cap to prevent unbounded growth from spam)
+	// Store as pending (cap to prevent unbounded growth from spam). A
+	// request the registry could not confirm does not replace one it did
+	// confirm under another key, so it cannot swap in its own key and
+	// justification for the operator to approve.
+	if p, exists := hm.pending[peerNodeID]; exists && p.KeyConfirmed && !registryBound &&
+		subtle.ConstantTimeCompare([]byte(p.PublicKey), []byte(msg.PublicKey)) != 1 {
+		slog.Warn("unconfirmed handshake request under another key, keeping the confirmed pending one",
+			"peer_node_id", peerNodeID)
+		return
+	}
 	if _, exists := hm.pending[peerNodeID]; !exists {
 		if len(hm.pending) >= maxPendingHandshakes {
 			slog.Warn("pending handshake queue full, rejecting", "peer_node_id", peerNodeID)
@@ -1212,6 +1272,7 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 	hm.setPendingLocked(peerNodeID, &PendingHandshake{
 		NodeID:        peerNodeID,
 		PublicKey:     msg.PublicKey,
+		KeyConfirmed:  registryBound,
 		Justification: justification,
 		ReceivedAt:    time.Now(),
 		Source:        source,
@@ -1229,7 +1290,13 @@ func (hm *Manager) handleRequest(stream coreapi.Stream, msg *HandshakeMsg, regis
 // matched against, and consumes, the hm.outgoing entry created by
 // SendRequest. Accepts with no matching entry are dropped, mirroring
 // processRelayedApproval's precondition on the relay path.
-func (hm *Manager) handleAccept(msg *HandshakeMsg) {
+//
+// registryBound is processMessage's verdict: the registry lists
+// msg.PublicKey for the sender. Only then does the record take that key
+// or drop a binding to another one. Otherwise the new record is left
+// unbound and bound by a registry lookup (scheduleBindLocked), and an
+// existing record bound to another key is kept and the accept ignored.
+func (hm *Manager) handleAccept(msg *HandshakeMsg, registryBound bool) {
 	peerNodeID := msg.NodeID
 	slog.Info("handshake accepted by peer", "peer_node_id", peerNodeID)
 
@@ -1253,30 +1320,48 @@ func (hm *Manager) handleAccept(msg *HandshakeMsg) {
 		return
 	}
 
+	// The key the new record is bound to: the accept's own, only when the
+	// registry confirmed it.
+	key := ""
+	if registryBound {
+		key = msg.PublicKey
+	}
+
 	// An accept that carries a different key than the record we hold
-	// comes from a different key holder behind the same node ID. Drop
-	// the record instead of rebinding it — re-trusting is an explicit
-	// handshake, not a side effect of an inbound accept.
+	// comes from a different key holder behind the same node ID. With
+	// the registry's confirmation, drop the record instead of rebinding
+	// it — re-trusting is an explicit handshake, not a side effect of an
+	// inbound accept. Without it, the accept cannot undo the binding, so
+	// it is ignored.
 	if existing, ok := hm.trusted[peerNodeID]; ok {
 		bound := existing.PublicKey
-		if !hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
-			hm.dropOutgoingLocked(peerNodeID)
+		if registryBound {
+			if !hm.reconcileTrustBindingLocked(peerNodeID, msg.PublicKey) {
+				hm.dropOutgoingLocked(peerNodeID)
+				return
+			}
+		} else if bound != "" && subtle.ConstantTimeCompare([]byte(bound), []byte(msg.PublicKey)) != 1 {
+			slog.Warn("ignoring handshake acceptance under another key the registry could not confirm", "peer_node_id", peerNodeID)
 			return
 		}
-		// Preserve an already-bound key when the accept omits one.
-		if msg.PublicKey == "" {
-			msg.PublicKey = bound
+		// Preserve an already-bound key when the accept brings none the
+		// registry confirmed.
+		if key == "" {
+			key = bound
 		}
 	}
 
 	hm.dropOutgoingLocked(peerNodeID)
 	hm.markTrustedLocked(peerNodeID, &TrustRecord{
 		NodeID:     peerNodeID,
-		PublicKey:  msg.PublicKey,
+		PublicKey:  key,
 		ApprovedAt: time.Now(),
 		Mutual:     true,
 	})
 	hm.markDirty()
+	if key == "" {
+		hm.scheduleBindLocked(peerNodeID)
+	}
 
 	// Report trust to registry
 	if reg := hm.rt.Registry(); reg != nil {
@@ -1361,8 +1446,19 @@ func (hm *Manager) ProcessRelayedRequest(fromNodeID uint32, justification string
 }
 
 // processRelayedRequest handles a handshake request received via registry relay.
+//
+// The relay vouches for the sender's node ID (only authenticated nodes
+// can relay) but carries no key. Every rule that grants trust on its own
+// (mutual, same network, trusted agent, trust-auto-approve) needs the
+// registry to confirm the requester's key first, as on the direct path,
+// so the key is looked up before anything else and the record is bound
+// to it. When the registry gives no key, nothing is granted
+// automatically and the request waits for the operator.
 func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string) {
 	justification = sanitizeJustification(justification)
+
+	// A registry RPC, so before taking hm.mu. "" means not confirmed.
+	regKey, _ := hm.registryKey(fromNodeID)
 
 	// As in handleRequest: the pending caps are enforced where the request is
 	// queued, below, so a full queue does not stop a peer the auto-accept
@@ -1371,118 +1467,35 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	// Already trusted?
-	if _, ok := hm.trusted[fromNodeID]; ok {
-		slog.Debug("relayed request from already-trusted node", "peer_node_id", fromNodeID)
-		// Respond via registry that we accept
-		if reg := hm.rt.Registry(); reg != nil {
-			nodeID, peerID := hm.rt.NodeID(), fromNodeID
-			sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerID))
-			hm.goRPCLocked(func() { reg.RespondHandshake(nodeID, peerID, true, sig) })
+	// Already trusted? The registry's key settles the binding as on the
+	// direct path: an unbound record takes it, and a record bound to
+	// another key is dropped and the request handled as new below.
+	if rec, ok := hm.trusted[fromNodeID]; ok {
+		stands := true
+		if regKey != "" {
+			stands = hm.reconcileTrustBindingLocked(fromNodeID, regKey)
+		} else if rec.PublicKey == "" {
+			hm.scheduleBindLocked(fromNodeID)
 		}
-		return
+		if stands {
+			slog.Debug("relayed request from already-trusted node", "peer_node_id", fromNodeID)
+			// Respond via registry that we accept
+			if reg := hm.rt.Registry(); reg != nil {
+				nodeID, peerID := hm.rt.NodeID(), fromNodeID
+				sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerID))
+				hm.goRPCLocked(func() { reg.RespondHandshake(nodeID, peerID, true, sig) })
+			}
+			return
+		}
 	}
 
-	// Check if we have an outgoing request to this peer (mutual handshake)
-	if _, ok := hm.outgoing[fromNodeID]; ok {
-		hm.dropOutgoingLocked(fromNodeID)
-		hm.markTrustedLocked(fromNodeID, &TrustRecord{
-			NodeID:     fromNodeID,
-			ApprovedAt: time.Now(),
-			Mutual:     true,
-		})
-		slog.Info("mutual relayed handshake auto-approved", "peer_node_id", fromNodeID)
-		hm.markDirty()
-		// Respond via registry and backfill public key
-		if reg := hm.rt.Registry(); reg != nil {
-			nodeID, peerID := hm.rt.NodeID(), fromNodeID
-			sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerID))
-			hm.goRPCLocked(func() {
-				reg.RespondHandshake(nodeID, peerID, true, sig)
-				hm.backfillPeerKey(peerID)
-			})
+	if regKey != "" {
+		if hm.autoApproveRelayedLocked(fromNodeID, regKey) {
+			return
 		}
-		return
-	}
-
-	// Check if peers are on the same network (network trust)
-	if hm.sameNetwork(fromNodeID) {
-		hm.markTrustedLocked(fromNodeID, &TrustRecord{
-			NodeID:     fromNodeID,
-			ApprovedAt: time.Now(),
-			Network:    hm.sharedNetwork(fromNodeID),
-		})
-		slog.Info("same network relayed handshake auto-approved", "peer_node_id", fromNodeID)
-		hm.markDirty()
-		if reg := hm.rt.Registry(); reg != nil {
-			nodeID, peerID := hm.rt.NodeID(), fromNodeID
-			sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerID))
-			hm.goRPCLocked(func() {
-				reg.RespondHandshake(nodeID, peerID, true, sig)
-				reg.ReportTrust(nodeID, peerID)
-				hm.backfillPeerKey(peerID)
-			})
-		}
-		return
-	}
-
-	// Auto-approve when the sender is in the embedded trusted-agents list.
-	// The registry relay vouches for the sender's node_id (only authenticated
-	// nodes can relay), so no separate registryBound check is needed here.
-	//
-	// The relay carries no peer public key, so the empty key is passed:
-	// allowlist entries that carry a pin do not match on this path.
-	if name, ok := hm.trustedAgentName(fromNodeID, ""); ok {
-		hm.markTrustedLocked(fromNodeID, &TrustRecord{
-			NodeID:     fromNodeID,
-			ApprovedAt: time.Now(),
-		})
-		slog.Info("relayed handshake auto-approved (trusted agent)",
-			"peer_node_id", fromNodeID, "agent", name)
-		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
-			"peer_node_id": fromNodeID, "reason": "trusted_agent", "agent": name,
-		})
-		hm.rt.PublishEvent("trust.changed", map[string]interface{}{
-			"peer_node_id": fromNodeID, "state": "granted", "reason": "trusted_agent_relayed", "agent": name,
-		})
-		hm.markDirty()
-		if reg := hm.rt.Registry(); reg != nil {
-			nodeID, peerID := hm.rt.NodeID(), fromNodeID
-			sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerID))
-			hm.goRPCLocked(func() {
-				reg.RespondHandshake(nodeID, peerID, true, sig)
-				reg.ReportTrust(nodeID, peerID)
-				hm.backfillPeerKey(peerID)
-			})
-		}
-		return
-	}
-
-	// Auto-approve all requests when the daemon is configured to do so.
-	if hm.rt.TrustAutoApprove() {
-		hm.markTrustedLocked(fromNodeID, &TrustRecord{
-			NodeID:     fromNodeID,
-			ApprovedAt: time.Now(),
-			Mutual:     false,
-		})
-		slog.Info("relayed handshake auto-approved (trust-auto-approve enabled)", "peer_node_id", fromNodeID)
-		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
-			"peer_node_id": fromNodeID, "reason": "auto_approve",
-		})
-		hm.rt.PublishEvent("trust.changed", map[string]interface{}{
-			"peer_node_id": fromNodeID, "state": "granted", "reason": "auto_approve_relayed",
-		})
-		hm.markDirty()
-		if reg := hm.rt.Registry(); reg != nil {
-			nodeID, peerID := hm.rt.NodeID(), fromNodeID
-			sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerID))
-			hm.goRPCLocked(func() {
-				reg.RespondHandshake(nodeID, peerID, true, sig)
-				reg.ReportTrust(nodeID, peerID)
-				hm.backfillPeerKey(peerID)
-			})
-		}
-		return
+	} else {
+		slog.Info("relayed handshake request: the registry did not confirm the sender's key, so no rule approves it automatically",
+			"peer_node_id", fromNodeID)
 	}
 
 	// Store as pending (for manual approval via pilotctl approve)
@@ -1504,6 +1517,82 @@ func (hm *Manager) processRelayedRequest(fromNodeID uint32, justification string
 	})
 	hm.markDirty()
 	slog.Info("relayed handshake request pending approval", "from_node_id", fromNodeID, "justification", justification)
+}
+
+// autoApproveRelayedLocked applies the automatic trust rules to a relayed
+// request whose sender the registry lists with regKey, and reports
+// whether one of them granted trust. The record is bound to regKey.
+// Caller MUST hold hm.mu.
+func (hm *Manager) autoApproveRelayedLocked(fromNodeID uint32, regKey string) bool {
+	rec := &TrustRecord{NodeID: fromNodeID, PublicKey: regKey, ApprovedAt: time.Now()}
+	var reason, agent string
+	switch {
+	case hm.hasOutgoingLocked(fromNodeID):
+		// We asked them too: a mutual handshake.
+		rec.Mutual = true
+		reason = "mutual"
+	case hm.sameNetwork(fromNodeID):
+		rec.Network = hm.sharedNetwork(fromNodeID)
+		reason = "same_network"
+	default:
+		// The registry's key is the key the sender authenticated to the
+		// relay with, so an allowlist pin is checked against it.
+		if name, ok := hm.trustedAgentName(fromNodeID, regKey); ok {
+			reason, agent = "trusted_agent", name
+		} else if hm.rt.TrustAutoApprove() {
+			reason = "auto_approve"
+		} else {
+			return false
+		}
+	}
+
+	hm.dropOutgoingLocked(fromNodeID)
+	hm.markTrustedLocked(fromNodeID, rec)
+	hm.markDirty()
+	switch reason {
+	case "mutual":
+		slog.Info("mutual relayed handshake auto-approved", "peer_node_id", fromNodeID)
+	case "same_network":
+		slog.Info("same network relayed handshake auto-approved", "peer_node_id", fromNodeID)
+	case "trusted_agent":
+		slog.Info("relayed handshake auto-approved (trusted agent)", "peer_node_id", fromNodeID, "agent", agent)
+		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
+			"peer_node_id": fromNodeID, "reason": "trusted_agent", "agent": agent,
+		})
+		hm.rt.PublishEvent("trust.changed", map[string]interface{}{
+			"peer_node_id": fromNodeID, "state": "granted", "reason": "trusted_agent_relayed", "agent": agent,
+		})
+	case "auto_approve":
+		slog.Info("relayed handshake auto-approved (trust-auto-approve enabled)", "peer_node_id", fromNodeID)
+		hm.rt.PublishEvent("handshake.auto_approved", map[string]interface{}{
+			"peer_node_id": fromNodeID, "reason": "auto_approve",
+		})
+		hm.rt.PublishEvent("trust.changed", map[string]interface{}{
+			"peer_node_id": fromNodeID, "state": "granted", "reason": "auto_approve_relayed",
+		})
+	}
+
+	if reg := hm.rt.Registry(); reg != nil {
+		nodeID, peerID := hm.rt.NodeID(), fromNodeID
+		sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerID))
+		mutual := rec.Mutual
+		hm.goRPCLocked(func() {
+			reg.RespondHandshake(nodeID, peerID, true, sig)
+			// The relayed mutual path has never reported the pair;
+			// kept as it was.
+			if !mutual {
+				reg.ReportTrust(nodeID, peerID)
+			}
+		})
+	}
+	return true
+}
+
+// hasOutgoingLocked reports whether this node has an unanswered request
+// out to nodeID. Caller MUST hold hm.mu.
+func (hm *Manager) hasOutgoingLocked(nodeID uint32) bool {
+	_, ok := hm.outgoing[nodeID]
+	return ok
 }
 
 // ProcessRelayedApproval handles a handshake approval received via registry relay.
@@ -1566,16 +1655,11 @@ func (hm *Manager) processRelayedApproval(fromNodeID uint32) {
 // other key is dropped, since the node ID now resolves to a different
 // identity than the one trust was granted to.
 func (hm *Manager) backfillPeerKey(peerNodeID uint32) {
-	reg := hm.rt.Registry()
-	if reg == nil {
-		return
-	}
-	resp, err := reg.Lookup(peerNodeID)
+	pubKeyB64, err := hm.registryKey(peerNodeID)
 	if err != nil {
 		slog.Debug("backfill peer key lookup failed", "peer_node_id", peerNodeID, "error", err)
 		return
 	}
-	pubKeyB64, _ := resp["public_key"].(string)
 	if pubKeyB64 == "" {
 		return
 	}
@@ -1607,6 +1691,71 @@ func (hm *Manager) backfillPeerKey(peerNodeID uint32) {
 	})
 }
 
+// registryKey returns the base64 Ed25519 key the registry lists for
+// nodeID: "" with a nil error when the registry has no key for it (or no
+// registry is wired), and the lookup's error when it failed. It is an
+// RPC, so the caller MUST NOT hold hm.mu.
+func (hm *Manager) registryKey(nodeID uint32) (string, error) {
+	reg := hm.rt.Registry()
+	if reg == nil {
+		return "", nil
+	}
+	resp, err := reg.Lookup(nodeID)
+	if err != nil {
+		return "", err
+	}
+	key, _ := resp["public_key"].(string)
+	return key, nil
+}
+
+// scheduleBind starts a registry lookup that binds nodeID's unbound
+// trust record to the key the registry lists (backfillPeerKey), unless
+// one was started for it within bindRetryInterval. This is how unbound
+// records get their key now that a key a caller presents is no longer
+// adopted. Caller MUST NOT hold hm.mu.
+func (hm *Manager) scheduleBind(nodeID uint32) {
+	if hm.claimBind(nodeID) {
+		hm.goRPC(func() { hm.backfillPeerKey(nodeID) })
+	}
+}
+
+// scheduleBindLocked is scheduleBind for a caller holding hm.mu
+// write-locked.
+func (hm *Manager) scheduleBindLocked(nodeID uint32) {
+	if hm.claimBind(nodeID) {
+		hm.goRPCLocked(func() { hm.backfillPeerKey(nodeID) })
+	}
+}
+
+// claimBind reports whether a registry bind may start for nodeID now,
+// and if so records the attempt.
+func (hm *Manager) claimBind(nodeID uint32) bool {
+	if hm.rt.Registry() == nil {
+		return false
+	}
+	now := time.Now()
+	hm.bindMu.Lock()
+	defer hm.bindMu.Unlock()
+	if last, ok := hm.bindTried[nodeID]; ok && now.Sub(last) < bindRetryInterval {
+		return false
+	}
+	hm.bindTried[nodeID] = now
+	return true
+}
+
+// reapBindAttempts forgets bind attempts older than bindRetryInterval,
+// which no longer hold anything back.
+func (hm *Manager) reapBindAttempts() {
+	cutoff := time.Now().Add(-bindRetryInterval)
+	hm.bindMu.Lock()
+	defer hm.bindMu.Unlock()
+	for id, at := range hm.bindTried {
+		if at.Before(cutoff) {
+			delete(hm.bindTried, id)
+		}
+	}
+}
+
 // ProcessRelayedRejection handles a handshake rejection received via registry relay.
 // Exported for daemon-side polling glue.
 func (hm *Manager) ProcessRelayedRejection(fromNodeID uint32) {
@@ -1636,9 +1785,17 @@ func (hm *Manager) ApproveHandshake(peerNodeID uint32) error {
 		hm.mu.Unlock()
 		return nil
 	}
+	// The request's key binds the record only if the registry confirmed
+	// it when the request came in. Otherwise (a relayed request, which
+	// has no key, or one the registry could not confirm) the record is
+	// bound to the registry's key by backfillPeerKey below.
+	key := ""
+	if req.KeyConfirmed {
+		key = req.PublicKey
+	}
 	hm.markTrustedLocked(peerNodeID, &TrustRecord{
 		NodeID:     peerNodeID,
-		PublicKey:  req.PublicKey,
+		PublicKey:  key,
 		ApprovedAt: time.Now(),
 	})
 	hm.markDirty()
@@ -1666,13 +1823,13 @@ func (hm *Manager) ApproveHandshake(peerNodeID uint32) error {
 	}
 	nodeID := hm.rt.NodeID()
 	sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerNodeID))
-	relayedRequest := req.PublicKey == ""
+	unbound := key == ""
 	hm.goRPC(func() {
 		if err := hm.retryRPC(func() error { _, err := reg.ReportTrust(nodeID, peerNodeID); return err }); err != nil {
 			slog.Warn("handshake approved, but the registry did not take the trust pair", "peer_node_id", peerNodeID, "error", err)
 		}
-		if relayedRequest {
-			hm.backfillPeerKey(peerNodeID) // a relayed request carries no key: take the registry's
+		if unbound {
+			hm.backfillPeerKey(peerNodeID) // no confirmed key on the request: take the registry's
 		}
 		relayErr := hm.retryRPC(func() error { _, err := reg.RespondHandshake(nodeID, peerNodeID, true, sig); return err })
 		if err := hm.sendAccept(peerNodeID); err != nil && relayErr != nil {
@@ -1845,13 +2002,22 @@ func (hm *Manager) trustedAgentName(peerNodeID uint32, pubKeyB64 string) (string
 	return hm.rt.IsTrusted(peerNodeID)
 }
 
-// IsTrusted returns whether a peer has been approved.
-//
-// This answers the node-ID-only question, for call sites that have no
-// peer key in scope (outbound dials, for instance). Callers that do
-// know the key the peer is currently presenting should use
-// IsTrustedWithKey instead so the record's binding is enforced.
+// IsTrusted returns whether a peer has been approved, by node ID alone.
+// It is IsTrustedByNodeID under the name the daemon's HandshakeService
+// interface (common/daemonapi) uses.
 func (hm *Manager) IsTrusted(nodeID uint32) bool {
+	return hm.IsTrustedByNodeID(nodeID)
+}
+
+// IsTrustedByNodeID reports whether a trust record exists for nodeID,
+// whatever key it is bound to. It answers for the node ID, not for
+// whoever presents it: use it only where no key the peer proved is in
+// scope and the node ID is all the question is about (an outbound dial,
+// a list of trusted peers, a gate before a key exchange that is itself
+// checked against the registry). Where the caller knows the key the
+// peer authenticated with, IsTrustedWithKey checks the record's binding.
+// It has no side effects.
+func (hm *Manager) IsTrustedByNodeID(nodeID uint32) bool {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
 	_, ok := hm.trusted[nodeID]
@@ -1860,22 +2026,25 @@ func (hm *Manager) IsTrusted(nodeID uint32) bool {
 
 // IsTrustedWithKey returns whether a peer has been approved, given the
 // base64 Ed25519 key that peer currently presents (same encoding as
-// TrustRecord.PublicKey — crypto.EncodePublicKey).
+// TrustRecord.PublicKey — crypto.EncodePublicKey). Callers pass a key
+// the peer proved, such as the key that authenticated its tunnel
+// session.
 //
-// A record bound to a different key does not describe the peer behind
-// this node ID any more, so it is dropped and the answer is false; the
-// peer has to handshake again under its new key.
-//
-// Both unknowns degrade to IsTrusted rather than to a denial, so
-// upgrades and older peers keep their trust:
-//
-//   - currentKeyB64 empty — no key resolved at the call site.
-//   - record unbound — pre-binding snapshot or a not-yet-backfilled
-//     relay record. It adopts currentKeyB64 here, so the binding takes
-//     effect from the first check that resolves a key.
+//   - Bound record, same key: trusted.
+//   - Bound record, different key: the record does not describe the
+//     peer behind this node ID any more, so it is dropped and the answer
+//     is false; the peer has to handshake again under its new key.
+//   - Bound record, empty key: false. With no key to check the binding
+//     against, the record cannot vouch for whoever is asking; callers
+//     that mean the node ID alone ask IsTrustedByNodeID.
+//   - Unbound record (a pre-binding snapshot, or a record made over the
+//     relay or from a request the registry could not confirm): trusted
+//     by node ID, which is all such a record grants. The presented key
+//     is not adopted: a registry lookup binds the record instead
+//     (scheduleBind), so the first key to turn up cannot claim it.
 //
 // The common case (bound key, matching) is served entirely under the
-// read lock; only adopting and dropping take the write lock.
+// read lock; only dropping takes the write lock.
 func (hm *Manager) IsTrustedWithKey(nodeID uint32, currentKeyB64 string) bool {
 	hm.mu.RLock()
 	rec, ok := hm.trusted[nodeID]
@@ -1888,33 +2057,18 @@ func (hm *Manager) IsTrustedWithKey(nodeID uint32, currentKeyB64 string) bool {
 	if !ok {
 		return false
 	}
-	if currentKeyB64 == "" {
+	if bound == "" {
+		hm.scheduleBind(nodeID)
 		return true
 	}
-	if bound == "" {
-		hm.adoptPeerKey(nodeID, currentKeyB64)
-		return true
+	if currentKeyB64 == "" {
+		return false
 	}
 	if subtle.ConstantTimeCompare([]byte(bound), []byte(currentKeyB64)) == 1 {
 		return true
 	}
 	hm.dropRebound(nodeID, bound)
 	return false
-}
-
-// adoptPeerKey binds keyB64 to an existing, still-unbound trust record.
-// No-op when the record has since gone away or been bound elsewhere.
-func (hm *Manager) adoptPeerKey(nodeID uint32, keyB64 string) {
-	hm.mu.Lock()
-	rec, ok := hm.trusted[nodeID]
-	if !ok || rec.PublicKey != "" {
-		hm.mu.Unlock()
-		return
-	}
-	rec.PublicKey = keyB64
-	hm.markDirty()
-	hm.mu.Unlock()
-	slog.Debug("bound peer public key to trust record", "peer_node_id", nodeID)
 }
 
 // dropRebound removes a trust record whose bound key no longer matches
@@ -1938,10 +2092,12 @@ func (hm *Manager) dropRebound(nodeID uint32, staleKey string) {
 }
 
 // reconcileTrustBindingLocked resolves an existing trust record against
-// the key a peer is presenting on an inbound handshake message, and
-// reports whether the record still stands. Same rules as
-// IsTrustedWithKey; separate because these call sites already hold
-// hm.mu write-locked. Caller MUST hold hm.mu.
+// a key the registry confirmed for nodeID, and reports whether the
+// record still stands: an unbound record is bound to the key, a record
+// bound to it stands, and a record bound to another key is dropped.
+// Callers MUST pass only a key the registry confirmed (registryBound, or
+// a registry lookup's answer); a key that is merely presented neither
+// binds nor drops a record. Caller MUST hold hm.mu.
 func (hm *Manager) reconcileTrustBindingLocked(nodeID uint32, currentKeyB64 string) bool {
 	rec, ok := hm.trusted[nodeID]
 	if !ok {

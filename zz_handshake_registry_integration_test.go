@@ -117,6 +117,7 @@ func TestApproveHandshakeMovesPendingToTrustedAndEmitsWebhook(t *testing.T) {
 	hm.pending[77] = &PendingHandshake{
 		NodeID:        77,
 		PublicKey:     "pending-pubkey",
+		KeyConfirmed:  true, // the registry listed this key when the request came in
 		Justification: "please",
 		ReceivedAt:    time.Now(),
 	}

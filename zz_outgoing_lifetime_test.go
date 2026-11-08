@@ -20,7 +20,7 @@ func TestOutgoing_AcceptanceHoursLaterIsHonoured(t *testing.T) {
 	hm.mu.Unlock()
 	hm.reapOutgoingAndRevoked() // the reaper must not drop it
 
-	hm.handleAccept(&HandshakeMsg{Type: HandshakeAccept, NodeID: 77, PublicKey: "k", Timestamp: time.Now().Unix()})
+	hm.handleAccept(&HandshakeMsg{Type: HandshakeAccept, NodeID: 77, PublicKey: "k", Timestamp: time.Now().Unix()}, true)
 
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()

@@ -107,13 +107,9 @@ func TestHandleConnectionValidMsgDispatchesToProcessMessage(t *testing.T) {
 	t.Cleanup(hm.Stop)
 	hm.outgoing[321] = time.Now()
 
-	msg := HandshakeMsg{
-		Type:      HandshakeReject,
-		NodeID:    321,
-		Reason:    "nope",
-		Timestamp: time.Now().Unix(),
-	}
-	raw, _ := json.Marshal(&msg)
+	msg := signedMsg(deterministicIdentity(32), HandshakeReject, 321, hm.rt.NodeID())
+	msg.Reason = "nope"
+	raw, _ := json.Marshal(msg)
 
 	stream := newMockStreamFrom(321, raw)
 
@@ -190,12 +186,8 @@ func TestProcessMessageReplayCaughtOnSecondDispatch(t *testing.T) {
 	t.Cleanup(hm.Stop)
 	hm.outgoing[33] = time.Now()
 
-	msg := &HandshakeMsg{
-		Type:      HandshakeReject,
-		NodeID:    33,
-		Reason:    "replay-test",
-		Timestamp: time.Now().Unix(),
-	}
+	msg := signedMsg(deterministicIdentity(33), HandshakeReject, 33, hm.rt.NodeID())
+	msg.Reason = "replay-test"
 
 	stream := &addrStream{addr: coreapi.Addr{Node: 33}}
 
@@ -331,11 +323,7 @@ func TestProcessMessageRevokeDispatchRemovesTrusted(t *testing.T) {
 	t.Cleanup(hm.Stop)
 	hm.trusted[99] = &TrustRecord{NodeID: 99}
 
-	msg := &HandshakeMsg{
-		Type:      HandshakeRevoke,
-		NodeID:    99,
-		Timestamp: time.Now().Unix(),
-	}
+	msg := signedMsg(deterministicIdentity(99), HandshakeRevoke, 99, hm.rt.NodeID())
 	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 99}}, msg)
 
 	hm.mu.RLock()

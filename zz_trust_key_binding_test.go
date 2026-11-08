@@ -66,41 +66,61 @@ func TestIsTrustedWithKeyDifferentKeyNotTrusted(t *testing.T) {
 }
 
 // Legacy records — persisted before keys were bound — keep working, so
-// an upgrade does not untrust anyone.
+// an upgrade does not untrust anyone. The presented key is not adopted:
+// only the registry binds an unbound record.
 func TestIsTrustedWithKeyLegacyUnboundRecordStaysTrusted(t *testing.T) {
 	t.Parallel()
-	hm, _ := newFakeHM(t)
+	hm, rt := newFakeHM(t)
+	rt.clearRegistry() // nothing to bind against
 
 	seedTrusted(hm, 42, "")
 
 	if !hm.IsTrustedWithKey(42, bindKeyA) {
 		t.Fatal("legacy unbound record must remain trusted")
 	}
-	if rec := trustRecordOf(hm, 42); rec == nil || rec.PublicKey != bindKeyA {
-		t.Fatalf("legacy record should have adopted the presented key: %+v", rec)
+	if rec := trustRecordOf(hm, 42); rec == nil || rec.PublicKey != "" {
+		t.Fatalf("an unbound record must not adopt a presented key: %+v", rec)
 	}
-	// Having adopted key A, it now rejects a different key.
-	if hm.IsTrustedWithKey(42, bindKeyB) {
-		t.Fatal("record should be bound after adoption")
+	// So the first key to turn up does not lock out the next one.
+	if !hm.IsTrustedWithKey(42, bindKeyB) {
+		t.Fatal("unbound record is node-ID trust until the registry binds it")
 	}
 }
 
-// A call site with no key in scope degrades to the node-ID-only answer
-// rather than denying.
-func TestIsTrustedWithKeyEmptyKeyFallsBackToNodeID(t *testing.T) {
+// A record bound to a key does not vouch for a caller that has no key to
+// check the binding against.
+func TestIsTrustedWithKeyEmptyKeyOnBoundRecordIsNotTrusted(t *testing.T) {
 	t.Parallel()
 	hm, _ := newFakeHM(t)
 
 	seedTrusted(hm, 42, bindKeyA)
 
-	if !hm.IsTrustedWithKey(42, "") {
-		t.Fatal("empty presented key should fall back to node-ID-only trust")
+	if hm.IsTrustedWithKey(42, "") {
+		t.Fatal("an empty key must not pass a key-bound record")
 	}
 	if hm.IsTrustedWithKey(43, "") {
 		t.Fatal("untrusted node must stay untrusted regardless of key")
 	}
-	if rec := trustRecordOf(hm, 42); rec.PublicKey != bindKeyA {
-		t.Fatalf("binding must not be cleared by a keyless check, got %q", rec.PublicKey)
+	if rec := trustRecordOf(hm, 42); rec == nil || rec.PublicKey != bindKeyA {
+		t.Fatalf("a keyless check must neither drop nor clear the binding: %+v", rec)
+	}
+	// The node-ID question is still answered, under its own name.
+	if !hm.IsTrustedByNodeID(42) || !hm.IsTrusted(42) {
+		t.Fatal("IsTrustedByNodeID answers by node ID alone")
+	}
+}
+
+// An unbound record checked with no key is node-ID trust, which is all
+// it grants.
+func TestIsTrustedWithKeyEmptyKeyOnUnboundRecordIsTrusted(t *testing.T) {
+	t.Parallel()
+	hm, rt := newFakeHM(t)
+	rt.clearRegistry()
+
+	seedTrusted(hm, 42, "")
+
+	if !hm.IsTrustedWithKey(42, "") {
+		t.Fatal("unbound record should answer by node ID")
 	}
 }
 
@@ -171,7 +191,7 @@ func TestHandleAcceptDifferentKeyDropsRecord(t *testing.T) {
 		NodeID:    42,
 		PublicKey: bindKeyB,
 		Timestamp: time.Now().Unix(),
-	})
+	}, true)
 
 	if rec := trustRecordOf(hm, 42); rec != nil {
 		t.Fatalf("accept from a different key holder must not keep or rebind the record: %+v", rec)
@@ -190,7 +210,7 @@ func TestHandleAcceptWithoutKeyPreservesBinding(t *testing.T) {
 		Type:      HandshakeAccept,
 		NodeID:    42,
 		Timestamp: time.Now().Unix(),
-	})
+	}, true)
 
 	rec := trustRecordOf(hm, 42)
 	if rec == nil {

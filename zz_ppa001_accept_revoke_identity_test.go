@@ -68,11 +68,7 @@ func TestPPA001_HonestAcceptOverMatchingStreamTrusts(t *testing.T) {
 	hm.outgoing[peer] = time.Now()
 	hm.mu.Unlock()
 
-	msg := &HandshakeMsg{
-		Type:      HandshakeAccept,
-		NodeID:    peer,
-		Timestamp: time.Now().Unix(),
-	}
+	msg := signedMsg(deterministicIdentity(50), HandshakeAccept, peer, 1)
 	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: peer}}, msg)
 
 	hm.mu.RLock()
@@ -127,11 +123,7 @@ func TestPPA001_HonestRevokeOverMatchingStreamRevokes(t *testing.T) {
 	hm.trusted[peer] = &TrustRecord{NodeID: peer, ApprovedAt: time.Now()}
 	hm.mu.Unlock()
 
-	msg := &HandshakeMsg{
-		Type:      HandshakeRevoke,
-		NodeID:    peer,
-		Timestamp: time.Now().Unix(),
-	}
+	msg := signedMsg(deterministicIdentity(80), HandshakeRevoke, peer, 1)
 	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: peer}}, msg)
 
 	hm.mu.RLock()

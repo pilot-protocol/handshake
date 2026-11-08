@@ -23,7 +23,7 @@ func TestFullPendingQueueDoesNotBlockAutoAccept(t *testing.T) {
 	t.Run("trust-auto-approve, direct", func(t *testing.T) {
 		m, _ := hsTestManager(t, true)
 		fillPending(m)
-		m.handleRequest(nil, &HandshakeMsg{NodeID: 5000, PublicKey: "k"}, false)
+		m.handleRequest(nil, &HandshakeMsg{NodeID: 5000, PublicKey: "k"}, true)
 		m.mu.RLock()
 		defer m.mu.RUnlock()
 		if _, ok := m.trusted[5000]; !ok {
@@ -35,7 +35,9 @@ func TestFullPendingQueueDoesNotBlockAutoAccept(t *testing.T) {
 	})
 
 	t.Run("trust-auto-approve, relayed", func(t *testing.T) {
-		m, _ := hsTestManager(t, true)
+		m, rt := newFakeHM(t)
+		rt.trustAutoApprove = true
+		rt.registry.setLookup(6000, map[string]interface{}{"public_key": bindKeyA})
 		fillPending(m)
 		m.processRelayedRequest(6000, "join")
 		m.mu.RLock()
@@ -46,7 +48,8 @@ func TestFullPendingQueueDoesNotBlockAutoAccept(t *testing.T) {
 	})
 
 	t.Run("mutual request, relayed", func(t *testing.T) {
-		m, _ := hsTestManager(t, false)
+		m, rt := newFakeHM(t)
+		rt.registry.setLookup(7000, map[string]interface{}{"public_key": bindKeyA})
 		fillPending(m)
 		m.mu.Lock()
 		m.outgoing[7000] = time.Now()
