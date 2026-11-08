@@ -767,13 +767,14 @@ func (hm *Manager) handleConnection(stream coreapi.Stream) {
 
 // processMessage handles an incoming handshake message.
 //
-// On a successful (claimed pubkey == registry-registered pubkey) match
-// we set registryBound = true and pass it to handleRequest and
-// handleAccept. Every automatic trust rule, and every binding or
-// rebinding of a trust record, requires that flag — without it,
-// trusting a peer by node_id alone is unsafe (registry down or no
-// record means we'd be relying on signature verification against a
-// claimed pubkey that nothing has tied to the claimed node ID).
+// Every message must carry a key and a signature over
+// "handshake:<sender>:<us>". On a successful (claimed pubkey ==
+// registry-registered pubkey) match we set registryBound = true and pass
+// it to handleRequest and handleAccept. Every automatic trust rule, and
+// every binding or rebinding of a trust record, requires that flag —
+// without it, trusting a peer by node_id alone is unsafe (registry down
+// or no record means we'd be relying on signature verification against
+// a claimed pubkey that nothing has tied to the claimed node ID).
 func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 	// Timestamp validation
 	now := time.Now()
@@ -797,50 +798,78 @@ func (hm *Manager) processMessage(stream coreapi.Stream, msg *HandshakeMsg) {
 		return
 	}
 
-	// M12 fix: verify P2P signature if the sender provides a public key
-	registryBound := false
-	if msg.PublicKey == "" && msg.Type == HandshakeRequest {
-		slog.Warn("handshake: request missing public key, rejecting", "peer_node_id", msg.NodeID)
+	// Every message must carry the sender's key and a signature, whatever
+	// its type. Every daemon release (v1.1.0 on) puts both on every
+	// message it sends here: sendMessage signs with the identity each
+	// daemon generates at start, and SendRequest, sendAccept,
+	// RejectHandshake and RevokeTrust all set PublicKey. Accept, reject
+	// and revoke used to be let through unsigned when they left the key
+	// out, with only the transport's source node ID standing for the
+	// sender, which proves nothing in plaintext mode.
+	if msg.PublicKey == "" {
+		slog.Warn("handshake: message missing public key, rejecting", "peer_node_id", msg.NodeID, "type", msg.Type)
 		return
 	}
-	if msg.PublicKey != "" {
-		if msg.Signature == "" {
-			slog.Warn("handshake: missing signature from authenticated node", "peer_node_id", msg.NodeID)
-			return
-		}
+	if msg.Signature == "" {
+		slog.Warn("handshake: message missing signature, rejecting", "peer_node_id", msg.NodeID, "type", msg.Type)
+		return
+	}
 
-		// M3 fix: verify claimed pubkey against registry-registered key
-		verifyKey := msg.PublicKey
-		if reg := hm.rt.Registry(); reg != nil {
-			resp, err := reg.Lookup(msg.NodeID)
-			if err == nil {
-				if regPubKey, ok := resp["public_key"].(string); ok && regPubKey != "" {
-					if subtle.ConstantTimeCompare([]byte(regPubKey), []byte(msg.PublicKey)) != 1 {
-						slog.Warn("handshake: pubkey mismatch with registry",
-							"peer_node_id", msg.NodeID)
-						return
-					}
-					verifyKey = regPubKey
-					registryBound = true
+	// registryBound: the registry lists msg.PublicKey for msg.NodeID. Only
+	// then may the key bind a trust record or replace a bound one.
+	registryBound := false
+	verifyKey := msg.PublicKey
+	if reg := hm.rt.Registry(); reg != nil {
+		resp, err := reg.Lookup(msg.NodeID)
+		if err == nil {
+			if regPubKey, ok := resp["public_key"].(string); ok && regPubKey != "" {
+				if subtle.ConstantTimeCompare([]byte(regPubKey), []byte(msg.PublicKey)) != 1 {
+					slog.Warn("handshake: pubkey mismatch with registry",
+						"peer_node_id", msg.NodeID)
+					return
 				}
+				verifyKey = regPubKey
+				registryBound = true
 			}
 		}
+	}
 
-		challenge := fmt.Sprintf("handshake:%d:%d", msg.NodeID, hm.rt.NodeID())
-		pubKeyBytes, err := base64.StdEncoding.DecodeString(verifyKey)
-		if err != nil {
-			slog.Warn("handshake: invalid public key encoding", "peer_node_id", msg.NodeID, "err", err)
-			return
+	// Without the registry, a signature checked against the key the
+	// message brings proves only that the sender holds some key. For the
+	// messages that act on trust already granted, the key the record is
+	// bound to stands in for the registry: an accept, reject or revoke
+	// from a trusted peer must be signed by the key it was trusted under.
+	if !registryBound && msg.Type != HandshakeRequest {
+		hm.mu.RLock()
+		var bound string
+		if rec, ok := hm.trusted[msg.NodeID]; ok {
+			bound = rec.PublicKey
 		}
-		sigBytes, err := base64.StdEncoding.DecodeString(msg.Signature)
-		if err != nil {
-			slog.Warn("handshake: invalid signature encoding", "peer_node_id", msg.NodeID, "err", err)
-			return
+		hm.mu.RUnlock()
+		if bound != "" {
+			if subtle.ConstantTimeCompare([]byte(bound), []byte(msg.PublicKey)) != 1 {
+				slog.Warn("handshake: key differs from the trusted key and the registry could not confirm it, rejecting",
+					"peer_node_id", msg.NodeID, "type", msg.Type)
+				return
+			}
+			verifyKey = bound
 		}
-		if !crypto.Verify(pubKeyBytes, []byte(challenge), sigBytes) {
-			slog.Warn("handshake: P2P signature verification failed", "peer_node_id", msg.NodeID)
-			return
-		}
+	}
+
+	challenge := fmt.Sprintf("handshake:%d:%d", msg.NodeID, hm.rt.NodeID())
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(verifyKey)
+	if err != nil {
+		slog.Warn("handshake: invalid public key encoding", "peer_node_id", msg.NodeID, "err", err)
+		return
+	}
+	sigBytes, err := base64.StdEncoding.DecodeString(msg.Signature)
+	if err != nil {
+		slog.Warn("handshake: invalid signature encoding", "peer_node_id", msg.NodeID, "err", err)
+		return
+	}
+	if !crypto.Verify(pubKeyBytes, []byte(challenge), sigBytes) {
+		slog.Warn("handshake: P2P signature verification failed", "peer_node_id", msg.NodeID)
+		return
 	}
 
 	// accept / reject / revoke all act on existing local state (they grant
