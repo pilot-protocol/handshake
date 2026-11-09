@@ -45,9 +45,11 @@ func TestProcessRelayedRequestAlreadyTrustedShortCircuits(t *testing.T) {
 
 func TestProcessRelayedRequestMutualAutoApproves(t *testing.T) {
 	t.Parallel()
-	hm := newTestHM(t, "")
-	t.Cleanup(hm.Stop)
+	hm, rt := newFakeHM(t)
+	rt.registry.setLookup(99, map[string]interface{}{"public_key": bindKeyA})
+	hm.mu.Lock()
 	hm.outgoing[99] = time.Now()
+	hm.mu.Unlock()
 
 	hm.processRelayedRequest(99, "")
 
@@ -64,9 +66,9 @@ func TestProcessRelayedRequestMutualAutoApproves(t *testing.T) {
 	if stillOutgoing {
 		t.Fatal("outgoing[99] should have been cleared")
 	}
-	// PublicKey is NOT populated by the relay path (comes from backfillPeerKey goRPC).
-	if rec.PublicKey != "" {
-		t.Fatalf("PublicKey should be empty on relay mutual path (got %q)", rec.PublicKey)
+	// The relay carries no key: the record is bound to the registry's.
+	if rec.PublicKey != bindKeyA {
+		t.Fatalf("PublicKey = %q, want the registry's key", rec.PublicKey)
 	}
 }
 
@@ -74,10 +76,9 @@ func TestProcessRelayedRequestMutualAutoApproves(t *testing.T) {
 
 func TestProcessRelayedRequestAutoApproveMarksNonMutual(t *testing.T) {
 	t.Parallel()
-	rt := newTestRuntime()
+	hm, rt := newFakeHM(t)
 	rt.trustAutoApprove = true
-	hm := NewManager(rt)
-	t.Cleanup(hm.Stop)
+	rt.registry.setLookup(55, map[string]interface{}{"public_key": bindKeyA})
 
 	hm.processRelayedRequest(55, "from-relay")
 
@@ -90,6 +91,9 @@ func TestProcessRelayedRequestAutoApproveMarksNonMutual(t *testing.T) {
 	}
 	if rec.Mutual {
 		t.Fatal("rec.Mutual should be false (auto_approve, not mutual)")
+	}
+	if rec.PublicKey != bindKeyA {
+		t.Fatalf("PublicKey = %q, want the registry's key", rec.PublicKey)
 	}
 	if isPending {
 		t.Fatal("pending[55] should NOT be set when auto-approved")
@@ -131,10 +135,9 @@ func TestProcessRelayedRequestTrustedAgentAutoApproves(t *testing.T) {
 	// NOT parallel — setTestTrustedAgents mutates a package-level map.
 	setTestTrustedAgents(t, []testAgent{{NodeID: 77, Hostname: "crtsh.example"}})
 
-	rt := newTestRuntime()
+	hm, rt := newFakeHM(t)
 	rt.trustChecker = testTrustChecker{}
-	hm := NewManager(rt)
-	t.Cleanup(hm.Stop)
+	rt.registry.setLookup(77, map[string]interface{}{"public_key": bindKeyA})
 
 	hm.processRelayedRequest(77, "service-agent reply handshake")
 

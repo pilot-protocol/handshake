@@ -81,8 +81,11 @@ func TestPPA008_DistinctSendersGetDistinctReplayKeys(t *testing.T) {
 	hm.mu.Unlock()
 
 	ts := time.Now().Unix()
-	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 11}}, &HandshakeMsg{Type: HandshakeReject, NodeID: 11, Timestamp: ts})
-	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 22}}, &HandshakeMsg{Type: HandshakeReject, NodeID: 22, Timestamp: ts})
+	from11 := signedMsg(deterministicIdentity(11), HandshakeReject, 11, hm.rt.NodeID())
+	from22 := signedMsg(deterministicIdentity(22), HandshakeReject, 22, hm.rt.NodeID())
+	from11.Timestamp, from22.Timestamp = ts, ts
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 11}}, from11)
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 22}}, from22)
 
 	hm.mu.RLock()
 	_, out11 := hm.outgoing[11]

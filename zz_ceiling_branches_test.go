@@ -143,7 +143,7 @@ func TestProcessRelayedRequest_AutoApproveWithRegistryFiresRespond(t *testing.T)
 	rt.mu.Unlock()
 
 	rt.registry.setLookup(1, map[string]interface{}{"networks": []interface{}{}})
-	rt.registry.setLookup(5555, map[string]interface{}{"networks": []interface{}{}})
+	rt.registry.setLookup(5555, map[string]interface{}{"networks": []interface{}{}, "public_key": bindKeyA})
 
 	hm.processRelayedRequest(5555, "")
 
@@ -173,7 +173,7 @@ func TestProcessRelayedRequest_MutualWithRegistryFiresRespond(t *testing.T) {
 	rt.mu.Unlock()
 	hm.outgoing[6666] = time.Now()
 
-	rt.registry.setLookup(6666, map[string]interface{}{"networks": []interface{}{}})
+	rt.registry.setLookup(6666, map[string]interface{}{"networks": []interface{}{}, "public_key": bindKeyA})
 
 	hm.processRelayedRequest(6666, "")
 
@@ -276,7 +276,7 @@ func TestHandleAccept_RecentlyRevokedDrops(t *testing.T) {
 		Type:      HandshakeAccept,
 		NodeID:    60,
 		Timestamp: time.Now().Unix(),
-	})
+	}, true)
 
 	hm.mu.RLock()
 	_, trusted := hm.trusted[60]
@@ -310,7 +310,7 @@ func TestHandleAccept_ExpiredRevokeAllowsTrustAndFiresReport(t *testing.T) {
 		NodeID:    70,
 		PublicKey: "pk70",
 		Timestamp: time.Now().Unix(),
-	})
+	}, true)
 
 	hm.mu.RLock()
 	_, trusted := hm.trusted[70]
@@ -549,12 +549,8 @@ func TestProcessMessage_ReplaySetFullStillDispatches(t *testing.T) {
 	}
 	hm.replayMu.Unlock()
 
-	msg := &HandshakeMsg{
-		Type:      HandshakeReject,
-		NodeID:    77,
-		Reason:    "test",
-		Timestamp: time.Now().Unix(),
-	}
+	msg := signedMsg(deterministicIdentity(77), HandshakeReject, 77, hm.rt.NodeID())
+	msg.Reason = "test"
 	// Seed an outgoing entry so the dispatch is observable.
 	hm.outgoing[77] = time.Now()
 	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 77}}, msg)

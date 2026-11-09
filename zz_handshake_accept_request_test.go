@@ -34,7 +34,7 @@ func TestHandleAcceptAddsPeerToTrustedAndRemovesOutgoing(t *testing.T) {
 		PublicKey: "some-pubkey",
 		Timestamp: time.Now().Unix(),
 	}
-	hm.handleAccept(msg)
+	hm.handleAccept(msg, true)
 
 	if _, ok := hm.outgoing[77]; ok {
 		t.Fatal("outgoing[77] should have been cleared after accept")
@@ -93,8 +93,9 @@ func TestHandleRequestAlreadyTrustedSendsAcceptWithoutDuplicating(t *testing.T) 
 }
 
 // A request for an already-trusted node ID that carries a different key
-// is a different key holder behind a recycled node ID. The record is
-// dropped and the request falls through to the normal approval flow.
+// the registry confirmed is a different key holder behind a recycled
+// node ID. The record is dropped and the request falls through to the
+// normal approval flow.
 func TestHandleRequestTrustedNodeWithDifferentKeyDropsRecord(t *testing.T) {
 	t.Parallel()
 	hm, _ := hsTestManager(t, false)
@@ -112,7 +113,7 @@ func TestHandleRequestTrustedNodeWithDifferentKeyDropsRecord(t *testing.T) {
 		PublicKey: "reclaimed-key",
 		Timestamp: time.Now().Unix(),
 	}
-	hm.handleRequest(nil, msg, false)
+	hm.handleRequest(nil, msg, true) // the registry lists reclaimed-key for 42
 
 	hm.mu.RLock()
 	_, stillTrusted := hm.trusted[42]
@@ -128,9 +129,9 @@ func TestHandleRequestTrustedNodeWithDifferentKeyDropsRecord(t *testing.T) {
 }
 
 // A record persisted before keys were bound (or one whose registry
-// backfill never landed) keeps working, and adopts the first key it
-// sees.
-func TestHandleRequestUnboundLegacyRecordAdoptsKey(t *testing.T) {
+// backfill never landed) keeps working, and takes the key of a request
+// the registry confirmed.
+func TestHandleRequestUnboundLegacyRecordAdoptsConfirmedKey(t *testing.T) {
 	t.Parallel()
 	hm, _ := hsTestManager(t, false)
 	defer waitForGoRPCDrain()
@@ -146,7 +147,7 @@ func TestHandleRequestUnboundLegacyRecordAdoptsKey(t *testing.T) {
 		PublicKey: "first-seen-key",
 		Timestamp: time.Now().Unix(),
 	}
-	hm.handleRequest(nil, msg, false)
+	hm.handleRequest(nil, msg, true)
 
 	hm.mu.RLock()
 	rec := hm.trusted[42]
@@ -208,7 +209,7 @@ func TestHandleRequestAutoApproveWhenTrustAutoApproveEnabled(t *testing.T) {
 		PublicKey: "key-55",
 		Timestamp: time.Now().Unix(),
 	}
-	hm.handleRequest(nil, msg, false)
+	hm.handleRequest(nil, msg, true) // the registry confirmed key-55
 
 	hm.mu.RLock()
 	rec, ok := hm.trusted[55]
@@ -371,18 +372,14 @@ func TestProcessMessageDispatchesHandshakeAccept(t *testing.T) {
 	hm := newTestHM(t, "")
 	t.Cleanup(hm.Stop)
 
-	// Omit PublicKey so processMessage skips the signature-required check
-	// and dispatches through the Type switch to handleAccept. The accept
-	// completes an outgoing request, so one has to be in flight.
+	// A signed accept dispatches through the Type switch to
+	// handleAccept. The accept completes an outgoing request, so one has
+	// to be in flight.
 	hm.mu.Lock()
 	hm.outgoing[44] = time.Now()
 	hm.mu.Unlock()
 
-	msg := &HandshakeMsg{
-		Type:      HandshakeAccept,
-		NodeID:    44,
-		Timestamp: time.Now().Unix(),
-	}
+	msg := signedMsg(deterministicIdentity(44), HandshakeAccept, 44, hm.rt.NodeID())
 	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 44}}, msg)
 
 	hm.mu.RLock()

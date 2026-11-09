@@ -25,7 +25,7 @@ func TestHandleAccept_WithoutOutgoingRequestDropped(t *testing.T) {
 		NodeID:    4242,
 		PublicKey: "pk4242",
 		Timestamp: time.Now().Unix(),
-	})
+	}, true)
 
 	hm.mu.RLock()
 	_, trusted := hm.trusted[4242]
@@ -74,7 +74,7 @@ func TestHandleAccept_ConsumesOutgoingEntryOnce(t *testing.T) {
 		PublicKey: "pk4444",
 		Timestamp: time.Now().Unix(),
 	}
-	hm.handleAccept(msg)
+	hm.handleAccept(msg, true)
 
 	hm.mu.RLock()
 	_, trusted := hm.trusted[peer]
@@ -91,7 +91,7 @@ func TestHandleAccept_ConsumesOutgoingEntryOnce(t *testing.T) {
 	hm.mu.Lock()
 	delete(hm.trusted, peer)
 	hm.mu.Unlock()
-	hm.handleAccept(msg)
+	hm.handleAccept(msg, true)
 
 	hm.mu.RLock()
 	_, reTrusted := hm.trusted[peer]
@@ -165,11 +165,8 @@ func TestProcessMessage_RejectOverMatchingStreamCancels(t *testing.T) {
 	hm.outgoing[peer] = time.Now()
 	hm.mu.Unlock()
 
-	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: peer}}, &HandshakeMsg{
-		Type:      HandshakeReject,
-		NodeID:    peer,
-		Timestamp: time.Now().Unix(),
-	})
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: peer}},
+		signedMsg(deterministicIdentity(72), HandshakeReject, peer, hm.rt.NodeID()))
 
 	hm.mu.RLock()
 	_, stillOutgoing := hm.outgoing[peer]
@@ -212,11 +209,8 @@ func TestProcessMessage_UnverifiedMessageDoesNotConsumeReplayCapacity(t *testing
 	hm.mu.Lock()
 	hm.outgoing[901] = time.Now()
 	hm.mu.Unlock()
-	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 901}}, &HandshakeMsg{
-		Type:      HandshakeReject,
-		NodeID:    901,
-		Timestamp: time.Now().Unix(),
-	})
+	hm.processMessage(&addrStream{addr: coreapi.Addr{Node: 901}},
+		signedMsg(deterministicIdentity(91), HandshakeReject, 901, hm.rt.NodeID()))
 
 	hm.replayMu.Lock()
 	size = len(hm.replaySet)

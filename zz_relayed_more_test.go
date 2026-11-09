@@ -31,7 +31,8 @@ func TestProcessRelayedRequest_AlreadyTrustedIsAccept(t *testing.T) {
 // outgoing → mutual path.
 func TestProcessRelayedRequest_MutualHandshakeAutoApproves(t *testing.T) {
 	t.Parallel()
-	hm := newTestHM(t, "")
+	hm, rt := newFakeHM(t)
+	rt.registry.setLookup(99, map[string]interface{}{"public_key": bindKeyA})
 	// Seed an outgoing request to peer 99.
 	hm.mu.Lock()
 	hm.outgoing[99] = time.Now()
