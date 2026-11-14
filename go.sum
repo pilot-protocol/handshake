@@ -2,8 +2,8 @@ github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNU
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/pilot-protocol/common v0.6.2 h1:ZKqv6L/CDDv9uINKhB/qIITVV2KhmLqox1oz8vaJ1xY=
 github.com/pilot-protocol/common v0.6.2/go.mod h1:OTXD84ScrBbKTAhawgFlLw9HtisgNvr83Zs1yDAuG9k=
-github.com/pilot-protocol/pilotprotocol v1.14.0 h1:ZJdi/++Sr9GltX/dIdVRFbqeJrezSc3+imXYfY0etbc=
-github.com/pilot-protocol/pilotprotocol v1.14.0/go.mod h1:Gwm237UjEqcDCa5sqpOdIUymm/9J+JIanx450rla4yg=
+github.com/pilot-protocol/pilotprotocol v1.19.0 h1:pvJEcoZGalKvOzI4w234X2bbuTCD5ADNRF293mb39aY=
+github.com/pilot-protocol/pilotprotocol v1.19.0/go.mod h1:zBkNZsORRdYC45OmHOpsYfu9EdpY63mVKgg38bIGl2A=
 github.com/pilot-protocol/rendezvous v0.2.8 h1:GRJyNplqNrfhPuCUgOAaY5Dg5En4G2aO+W2oCNKuIlo=
 github.com/pilot-protocol/rendezvous v0.2.8/go.mod h1:sv0TuqAosOCe3f3EIuZ9lmrNaHJTqyy5k/UGFqHskB4=
 github.com/pilot-protocol/trustedagents v0.2.6 h1:dFKr6V+lJr947v3iUyR7EflUTusGfKkItAmsqJfWc8g=
